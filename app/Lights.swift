@@ -78,3 +78,34 @@ enum Bridge {
         return (result.1 as? HTTPURLResponse)?.statusCode == 200
     }
 }
+
+// MARK: - Starting the bridge from Glance
+
+extension Glance {
+    /// Starts Look and Nod's bulb bridge in the background, the same as running
+    /// `cd ~/LookAndNod && python3 bulb_server.py` in Terminal.
+    func startBridge() {
+        lightNote = "Starting the bridge..."
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        p.arguments = ["-lc", "pkill -f bulb_server.py; cd ~/LookAndNod && (nohup python3 bulb_server.py > bridge.log 2>&1 &)"]
+        do {
+            try p.run()
+        } catch {
+            lightNote = "Couldn't start the bridge. In Terminal run: cd ~/LookAndNod && python3 bulb_server.py"
+            return
+        }
+        Task {
+            for _ in 0..<8 {
+                try? await Task.sleep(for: .seconds(1))
+                if let list = await Bridge.devices() {
+                    bridgeLights = list
+                    bridgeOnline = true
+                    break
+                }
+            }
+            lightNote = bridgeOnline ? "Bridge running." :
+                "The bridge didn't start. Check ~/LookAndNod/bridge.log, or run it in Terminal to see the error."
+        }
+    }
+}

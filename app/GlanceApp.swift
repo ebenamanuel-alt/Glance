@@ -19,6 +19,11 @@ struct GlanceApp: App {
         }
         .windowResizability(.contentMinSize)
 
+        Window("Glance Settings", id: "settings") {
+            SettingsView().environmentObject(glance)
+        }
+        .windowResizability(.contentMinSize)
+
         MenuBarExtra("Glance", systemImage: menuIcon) {
             MenuContent().environmentObject(glance)
         }

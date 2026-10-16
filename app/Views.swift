@@ -1,367 +1,816 @@
-//  Glance: the window, the settings panel and the menu bar menu.
+//  Glance: the main window, the settings window and the menu bar menu.
 
 import SwiftUI
 import AppKit
+
+extension ScreenInfo {
+    /// The MacBook's own screen, rather than an external monitor
+    var isBuiltIn: Bool { CGDisplayIsBuiltin(displayID) != 0 }
+}
 
 // MARK: - Main window
 
 struct ContentView: View {
     @EnvironmentObject var g: Glance
-    @State private var showSettings = false
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        VStack(spacing: 16) {
-            header
-            HStack(alignment: .top, spacing: 16) {
-                DeskMap()
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .background(RoundedRectangle(cornerRadius: 16).fill(Color.primary.opacity(0.04)))
-                    .overlay(RoundedRectangle(cornerRadius: 16).strokeBorder(Color.primary.opacity(0.08)))
-                screenList
-                    .frame(width: 340)
+        VStack(spacing: 0) {
+            topBar
+            Divider()
+            VStack(spacing: 14) {
+                StatusCard()
+                problems
+                HStack(alignment: .top, spacing: 14) {
+                    DeskScene()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Color.primary.opacity(0.1)))
+                    VStack(spacing: 14) {
+                        ScreensCard()
+                        GesturesCard()
+                        Spacer(minLength: 0)
+                    }
+                    .frame(width: 320)
+                }
             }
-            footer
+            .padding(18)
+            .background(Color(nsColor: .windowBackgroundColor))
         }
-        .padding(20)
-        .frame(minWidth: 920, minHeight: 580)
+        .frame(minWidth: 940, minHeight: 600)
         .onAppear { g.start() }
-
     }
 
-    // MARK: Header
+    // MARK: Top bar
 
-    private var header: some View {
+    private var topBar: some View {
         HStack(spacing: 14) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 11, style: .continuous)
-                    .fill(LinearGradient(colors: [.teal, .blue], startPoint: .top, endPoint: .bottom))
-                Image(systemName: "eye.fill").font(.system(size: 18, weight: .semibold)).foregroundStyle(.white)
+            Image(systemName: "eye.fill")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(width: 26, height: 26)
+                .background(Color.accentColor, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            Text("Glance").font(.headline)
+            Spacer()
+            Button {
+                openWindow(id: "settings")
+                NSApp.activate(ignoringOtherApps: true)
+            } label: {
+                Label("Settings", systemImage: "slider.horizontal.3")
             }
-            .frame(width: 40, height: 40)
+            .buttonStyle(.borderless)
+            .keyboardShortcut(",", modifiers: .command)
+            .help("Open settings (⌘ ,)")
+            Toggle("Glance on", isOn: $g.isOn)
+                .toggleStyle(.switch)
+                .help("Turn Glance on or off (⌃ ⌥ G)")
+        }
+        .padding(.horizontal, 16)
+        .frame(height: 48)
+        .background(.bar)
+    }
+
+    // MARK: Problems, each with its fix
+
+    @ViewBuilder private var problems: some View {
+        if !g.trusted {
+            ProblemBanner(symbol: "hand.raised.fill",
+                          text: "Glance needs Accessibility permission to move the cursor and windows.",
+                          button: "Open Accessibility") {
+                if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+                    NSWorkspace.shared.open(url)
+                }
+            }
+        }
+        if g.lightsEnabled && !g.bridgeOnline {
+            ProblemBanner(symbol: "lightbulb.slash",
+                          text: "The lights bridge isn't running, so your lights won't switch when you leave.",
+                          button: "Start bridge") { g.startBridge() }
+        }
+    }
+}
+
+struct ProblemBanner: View {
+    let symbol: String
+    let text: String
+    let button: String
+    let action: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: symbol).foregroundStyle(.orange)
+            Text(text).font(.callout).frame(maxWidth: .infinity, alignment: .leading)
+            Button(button, action: action).controlSize(.small)
+        }
+        .padding(.horizontal, 14).padding(.vertical, 9)
+        .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(Color.orange.opacity(0.3)))
+    }
+}
+
+// MARK: - Status card: what Glance is doing right now
+
+struct StatusCard: View {
+    @EnvironmentObject var g: Glance
+
+    private enum Mood { case good, waiting, off }
+
+    private var state: (mood: Mood, symbol: String, title: String, detail: String) {
+        let facingName = g.screens.first { $0.key == g.facing }?.name
+        if !g.isOn { return (.off, "eye.slash", "Glance is off", "Your screens work as normal. Switch it on at the top, or press ⌃ ⌥ G.") }
+        if !g.airpods { return (.waiting, "airpodspro", "Waiting for your AirPods", "Put your AirPods Pro in and Glance starts by itself.") }
+        if !g.worn { return (.waiting, "airpodspro", "Paused: AirPods out", "Your screens work as normal until you put them back in.") }
+        if g.needsRecentre { return (.waiting, "scope", "Face your main screen and recentre", "Your AirPods were away for a while, so Glance needs a fresh starting point.") }
+        if g.directions.isEmpty { return (.waiting, "display.2", "Save your screens to begin", "Look at each screen and press Save in the list on the right.") }
+        if g.hidden { return (.good, "lock.fill", "Screens hidden while you're away", "Look back at a screen, or hold ⌃ ⌥, to show them.") }
+        let dimmed = g.screens.filter { $0.key != g.activeScreen && g.directions[$0.key] != nil }.map(\.name)
+        var parts: [String] = []
+        if g.spotlight && !dimmed.isEmpty { parts.append("\(dimmed.joined(separator: ", ")) dimmed") }
+        parts.append("AirPods in")
+        if g.followCursor { parts.append("cursor follows your eyes") }
+        if let name = facingName { return (.good, "eye", "Active · looking at \(name)", parts.joined(separator: " · ")) }
+        return (.good, "eye", "Active · looking away", parts.joined(separator: " · "))
+    }
+
+    var body: some View {
+        let s = state
+        let tint: Color = s.mood == .good ? .green : (s.mood == .waiting ? .orange : .secondary)
+        HStack(spacing: 14) {
+            Image(systemName: s.symbol)
+                .font(.system(size: 18, weight: .medium))
+                .foregroundStyle(tint)
+                .frame(width: 38, height: 38)
+                .background(tint.opacity(0.14), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
             VStack(alignment: .leading, spacing: 2) {
-                Text("Glance").font(.system(size: 24, weight: .bold))
-                Text(g.message).font(.callout).foregroundStyle(.secondary).lineLimit(1)
+                Text(s.title).font(.system(size: 15, weight: .semibold)).lineLimit(1)
+                Text(s.detail).font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
-            Spacer(minLength: 12)
-            HStack(spacing: 14) {
-                pill("airpodspro", !g.airpods ? "AirPods" : (g.worn ? "AirPods in" : "AirPods out"), g.airpods && g.worn)
-                pill("hand.raised", g.trusted ? "Allowed" : "Allow Accessibility", g.trusted)
-                pill("keyboard", g.listening ? "Listening" : "⌃ ⌥", g.listening, neutral: true)
-            }
-            .padding(.horizontal, 14).padding(.vertical, 8)
-            .background(.regularMaterial, in: Capsule())
-            Toggle("On", isOn: $g.isOn).toggleStyle(.switch).labelsHidden().help("Turn Glance on or off")
-            Button { showSettings.toggle() } label: { Image(systemName: "slider.horizontal.3") }
-                .buttonStyle(.borderless)
-                .help("Settings")
-                .popover(isPresented: $showSettings, arrowEdge: .bottom) { SettingsPanel().environmentObject(g) }
-            Button { g.recentre() } label: { Label("Recentre", systemImage: "scope") }
+            Spacer(minLength: 8)
+            Button { g.recentreFromShortcut() } label: { Label("Recentre", systemImage: "scope") }
                 .buttonStyle(.borderedProminent)
-                .controlSize(.large)
                 .keyboardShortcut("r", modifiers: [])
-                .help("Face your main screen, then press this. Do it each time you start Glance.")
+                .help("Face your main screen, then press this (⌃ ⌥ R)")
         }
+        .padding(.horizontal, 16).padding(.vertical, 12)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Color.primary.opacity(0.08)))
     }
+}
 
-    private func pill(_ symbol: String, _ text: String, _ ok: Bool, neutral: Bool = false) -> some View {
-        HStack(spacing: 6) {
-            Circle().fill(ok ? Color.green : (neutral ? Color.secondary : Color.orange)).frame(width: 7, height: 7)
-            Image(systemName: symbol).foregroundStyle(.secondary)
-            Text(text)
-        }
-        .font(.caption.weight(.medium))
-    }
+// MARK: - Screens card
 
-    // MARK: Screens list
+struct ScreensCard: View {
+    @EnvironmentObject var g: Glance
 
-    private var screenList: some View {
-        VStack(alignment: .leading, spacing: 12) {
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
             HStack {
-                Label("Your screens", systemImage: "display.2").font(.headline)
+                Text("Screens").font(.headline)
                 Spacer()
                 Text("\(g.directions.count) of \(g.screens.count) saved").font(.caption).foregroundStyle(.secondary)
             }
-            ScrollView {
-                VStack(spacing: 10) {
-                    ForEach(g.screens) { s in screenRow(s) }
-                }
+            .padding(.horizontal, 14).padding(.top, 12).padding(.bottom, 6)
+            ForEach(Array(g.screens.enumerated()), id: \.element.id) { i, s in
+                if i > 0 { Divider().padding(.leading, 44) }
+                row(s)
             }
-            Spacer(minLength: 0)
         }
-        .padding(16)
-        .frame(maxHeight: .infinity)
-        .background(RoundedRectangle(cornerRadius: 16).fill(Color.primary.opacity(0.04)))
-        .overlay(RoundedRectangle(cornerRadius: 16).strokeBorder(Color.primary.opacity(0.08)))
+        .padding(.bottom, 4)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Color.primary.opacity(0.08)))
     }
 
-    private func screenRow(_ s: ScreenInfo) -> some View {
-        let saved = g.directions[s.key]
+    private func row(_ s: ScreenInfo) -> some View {
+        let saved = g.directions[s.key] != nil
         let looking = g.facing == s.key
-        return VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 10) {
-                Image(systemName: looking ? "eye.fill" : "display")
-                    .frame(width: 22)
-                    .foregroundStyle(looking ? Color.accentColor : Color.secondary)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(s.name).font(.body.weight(.semibold)).lineLimit(1)
-                    Text(saved == nil ? "Not saved yet" : (looking ? "You're looking at it" : "Saved"))
-                        .font(.caption)
-                        .foregroundStyle(looking ? Color.accentColor : (saved == nil ? Color.orange : Color.secondary))
-                }
-                Spacer()
-                Text("\(Int(s.frame.width))×\(Int(s.frame.height))").font(.caption2.monospacedDigit()).foregroundStyle(.tertiary)
+        let dimmed = g.spotlight && saved && g.activeScreen != nil && g.activeScreen != s.key
+        let detail = !saved ? "Not saved yet" : (looking ? "You're looking at it" : (dimmed ? "Saved · dimmed" : "Saved"))
+        return HStack(spacing: 10) {
+            Image(systemName: looking ? "eye" : (s.isBuiltIn ? "laptopcomputer" : "display"))
+                .frame(width: 20)
+                .foregroundStyle(looking ? Color.accentColor : Color.secondary)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(s.name).font(.system(size: 13, weight: .medium)).lineLimit(1)
+                Text(detail).font(.caption)
+                    .foregroundStyle(looking ? Color.accentColor : (saved ? Color.secondary : Color.orange))
             }
-            HStack(spacing: 8) {
-                if saved == nil {
-                    Button("Save direction") { g.save(s) }.buttonStyle(.borderedProminent)
-                } else {
-                    Button("Update direction") { g.save(s) }
-                }
-                Button("Which one?") { g.identify(s) }.help("Shows the name on that screen for a moment")
-                if saved != nil { Button("Forget") { g.forget(s) } }
+            Spacer(minLength: 6)
+            if !saved {
+                Button("Save") { g.save(s) }.controlSize(.small).buttonStyle(.borderedProminent)
+                    .help("Look at this screen, then press Save")
             }
-            .controlSize(.small)
+            Menu {
+                Button(saved ? "Update direction" : "Save direction") { g.save(s) }
+                Button("Show which screen this is") { g.identify(s) }
+                if saved {
+                    Divider()
+                    Button("Forget this screen", role: .destructive) { g.forget(s) }
+                }
+            } label: {
+                Image(systemName: "ellipsis")
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("More for \(s.name)")
         }
-        .padding(12)
-        .background(RoundedRectangle(cornerRadius: 12).fill(looking ? Color.accentColor.opacity(0.12) : Color.primary.opacity(0.03)))
-        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(looking ? Color.accentColor.opacity(0.6) : Color.clear, lineWidth: 1.5))
-    }
-
-    // MARK: Footer
-
-    private var footer: some View {
-        HStack(spacing: 18) {
-            hint("eye", g.autoSwitch ? "Look at a screen: the cursor follows" : "Hold ⌃ ⌥ and look: the cursor follows")
-            hint("arrow.down.circle", "Hold ⌃ ⌥ and nod: focus that window")
-            hint("macwindow.on.rectangle", "Hold ⌃ ⌥ ⌘ and look: move the window")
-            hint("lock.shield", "Look away: screens hide")
-            hint("command", "⌃ ⌥ G on/off · ⌃ ⌥ R recentre")
-            Spacer()
-        }
-        .font(.caption)
-        .foregroundStyle(.secondary)
-    }
-
-    private func hint(_ symbol: String, _ text: String) -> some View {
-        Label(text, systemImage: symbol)
+        .padding(.horizontal, 14).padding(.vertical, 9)
+        .background(looking ? Color.accentColor.opacity(0.08) : Color.clear)
     }
 }
 
-// MARK: - Desk map: your screens and where you're looking, seen from above
+// MARK: - Gestures card
 
-struct Placed: Identifiable {
-    let screen: ScreenInfo
-    let dir: Direction
-    var id: String { screen.key }
+struct GesturesCard: View {
+    private let items: [(String, String)] = [
+        ("⌃ ⌥ + nod", "Bring that window to the front"),
+        ("⌃ ⌥ ⌘ + look", "Move the window to that screen"),
+        ("⌃ ⌥ G", "Turn Glance on or off"),
+        ("⌃ ⌥ R", "Recentre"),
+    ]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Text("Gestures").font(.headline)
+            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 8) {
+                ForEach(items, id: \.0) { keys, text in
+                    GridRow {
+                        Text(keys)
+                            .font(.system(size: 11, design: .monospaced))
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 5))
+                            .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(Color.primary.opacity(0.12)))
+                        Text(text).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Color.primary.opacity(0.08)))
+    }
 }
 
-struct DeskMap: View {
+// MARK: - Desk scene: your real desk, your head, and where you're looking
+
+struct DeskScene: View {
     @EnvironmentObject var g: Glance
+
+    private struct Item: Identifiable {
+        let screen: ScreenInfo
+        let rect: CGRect
+        let lit: Bool
+        var id: String { screen.key }
+    }
 
     var body: some View {
         GeometryReader { geo in
             let size = geo.size
-            let c = CGPoint(x: size.width / 2, y: size.height / 2)
-            let saved = g.screens.compactMap { s in g.directions[s.key].map { Placed(screen: s, dir: $0) } }
-            let extent: Double = max(30, saved.map { max(abs($0.dir.yaw), abs($0.dir.pitch)) }.max() ?? 30)
-            let half: Double = Double(min(size.width, size.height)) / 2
-            let scale: Double = max(1, min(8, (half - 90) / extent))
-            let point: (Double, Double) -> CGPoint = { yaw, pitch in
-                CGPoint(x: Double(c.x) - yaw * scale, y: Double(c.y) - pitch * scale)
-            }
-            let ring = CGFloat(g.tolerance * scale * 2)
-            ZStack {
+            let deskY = size.height * 0.64
+            let items = layout(size: size, deskY: deskY)
+            let headCentre = CGPoint(x: size.width * 0.5, y: size.height * 0.70)
+            let turn = CGFloat(max(-30, min(30, -g.yaw * 0.7)))
+            let target = items.first { $0.screen.key == g.facing }
+
+            ZStack(alignment: .topLeading) {
+                // Wall and desk
+                LinearGradient(colors: [Color(white: 0.24), Color(white: 0.18)], startPoint: .top, endPoint: .bottom)
+                if let t = target {
+                    RadialGradient(colors: [Color(red: 0.66, green: 0.79, blue: 1).opacity(0.35), .clear],
+                                   center: .init(x: t.rect.midX / max(1, size.width), y: t.rect.midY / max(1, size.height)),
+                                   startRadius: 0, endRadius: size.width * 0.45)
+                }
+                Rectangle()
+                    .fill(LinearGradient(colors: [Color(red: 0.93, green: 0.92, blue: 0.90), Color(red: 0.81, green: 0.80, blue: 0.77)],
+                                         startPoint: .top, endPoint: .bottom))
+                    .frame(width: size.width, height: size.height - deskY)
+                    .offset(y: deskY)
+
+                // Keyboard and mice in front of the external monitor
+                if let ext = items.first(where: { !$0.screen.isBuiltIn }) {
+                    let kx = ext.rect.midX
+                    RoundedRectangle(cornerRadius: 4)
+                        .fill(Color(white: 0.96))
+                        .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(Color(white: 0.82)))
+                        .frame(width: size.width * 0.24, height: size.height * 0.08)
+                        .position(x: kx - size.width * 0.02, y: deskY + size.height * 0.11)
+                    Ellipse().fill(Color(white: 0.98)).overlay(Ellipse().strokeBorder(Color(white: 0.82)))
+                        .frame(width: 22, height: 12)
+                        .position(x: kx - size.width * 0.02, y: deskY + size.height * 0.035)
+                    Ellipse().fill(Color(white: 0.1))
+                        .frame(width: 28, height: 18)
+                        .position(x: min(size.width - 20, kx + size.width * 0.17), y: deskY + size.height * 0.13)
+                }
+
+                // Beam from your head to the screen you're looking at
+                if let t = target {
+                    Path { p in
+                        p.move(to: CGPoint(x: headCentre.x + turn * 0.6, y: headCentre.y - 36))
+                        p.addLine(to: CGPoint(x: t.rect.minX, y: t.rect.minY))
+                        p.addLine(to: CGPoint(x: t.rect.maxX, y: t.rect.minY))
+                        p.addLine(to: CGPoint(x: t.rect.maxX, y: t.rect.maxY))
+                        p.addLine(to: CGPoint(x: t.rect.minX, y: t.rect.maxY))
+                        p.closeSubpath()
+                    }
+                    .fill(LinearGradient(colors: [Color.blue.opacity(0.45), Color.blue.opacity(0.04)],
+                                         startPoint: .bottom, endPoint: .top))
+                    .animation(.easeOut(duration: 0.25), value: g.facing)
+                }
+
+                // The screens
+                ForEach(items) { item in
+                    if item.screen.isBuiltIn {
+                        LaptopView(lit: item.lit, dim: g.spotlightStrength, looking: g.facing == item.screen.key)
+                            .frame(width: item.rect.width, height: item.rect.height * 1.18)
+                            .position(x: item.rect.midX, y: item.rect.minY + item.rect.height * 0.59)
+                    } else {
+                        MonitorView(lit: item.lit, dim: g.spotlightStrength, looking: g.facing == item.screen.key,
+                                    deskY: deskY - item.rect.minY)
+                            .frame(width: item.rect.width, height: item.rect.height)
+                            .position(x: item.rect.midX, y: item.rect.midY)
+                    }
+                }
+
+                // You, from behind, with AirPods in
+                HeadView(turn: Double(turn), airpods: g.airpods && g.worn)
+                    .frame(width: 140, height: 150)
+                    .position(x: headCentre.x, y: headCentre.y + 40)
+                    .animation(.easeOut(duration: 0.15), value: turn)
+
+                // Labels
                 VStack {
                     HStack {
-                        Label("Your desk", systemImage: "rectangle.3.group").font(.headline)
+                        Text("Your desk").font(.headline).foregroundStyle(.white)
                         Spacer()
-                        Text(g.hidden ? "Screens hidden" : (g.listening ? "Listening" : ""))
-                            .font(.caption.weight(.medium)).foregroundStyle(.secondary)
+                        Text(g.airpods ? "Live from your AirPods" : "AirPods not connected")
+                            .font(.caption).foregroundStyle(.white)
+                            .padding(.horizontal, 8).padding(.vertical, 3)
+                            .background(Color.black.opacity(0.45), in: Capsule())
                     }
                     Spacer()
-                }
-                .padding(16)
-
-                ForEach(saved) { item in
-                    let s = item.screen
-                    let d = item.dir
-                    let w: CGFloat = 120
-                    let h = max(50, min(110, w * s.frame.height / max(1, s.frame.width)))
-                    let looking = g.facing == s.key
-                    let active = g.activeScreen == s.key
-                    VStack(spacing: 4) {
-                        RoundedRectangle(cornerRadius: 8)
-                            .fill(looking ? Color.accentColor.opacity(0.25) : Color.primary.opacity(0.07))
-                            .overlay(RoundedRectangle(cornerRadius: 8)
-                                .strokeBorder(looking ? Color.accentColor : Color.primary.opacity(0.25), lineWidth: looking ? 3 : 1.5))
-                            .overlay(Image(systemName: active ? "sun.max.fill" : "display")
-                                .foregroundStyle(active ? Color.yellow : Color.secondary))
-                            .frame(width: w, height: h)
-                            .shadow(color: looking ? Color.accentColor.opacity(0.5) : .clear, radius: 12)
-                        Text(s.name).font(.caption.weight(.semibold)).lineLimit(1).frame(maxWidth: 150)
+                    HStack {
+                        ForEach(items.sorted { $0.rect.midX < $1.rect.midX }) { item in
+                            let looking = g.facing == item.screen.key
+                            Text(looking ? "Looking at \(item.screen.name)" : (item.lit ? item.screen.name : "\(item.screen.name) · dimmed"))
+                                .font(.caption).foregroundStyle(.white).lineLimit(1)
+                                .padding(.horizontal, 9).padding(.vertical, 4)
+                                .background(looking ? Color.accentColor.opacity(0.9) : Color.black.opacity(0.55), in: Capsule())
+                            if item.id != items.sorted(by: { $0.rect.midX < $1.rect.midX }).last?.id { Spacer() }
+                        }
                     }
-                    .position(point(d.yaw, d.pitch))
-                    .animation(.easeOut(duration: 0.2), value: looking)
                 }
+                .padding(14)
+                .frame(width: size.width, height: size.height)
 
-                if saved.isEmpty {
+                if items.isEmpty {
                     VStack(spacing: 8) {
-                        Image(systemName: "display.2").font(.system(size: 36)).foregroundStyle(.secondary)
+                        Image(systemName: "display.2").font(.system(size: 34)).foregroundStyle(.white.opacity(0.8))
                         Text("1. Face your main screen and press Recentre.")
-                        Text("2. Look at each screen and press Save direction.")
+                        Text("2. Look at each screen and press Save.")
                     }
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+                    .font(.callout).foregroundStyle(.white.opacity(0.85))
+                    .frame(width: size.width, height: size.height * 0.6)
                 }
-
-                // Where your head is pointing
-                let head = point(g.yaw, g.pitch)
-                Circle()
-                    .stroke(Color.accentColor.opacity(0.25), lineWidth: 1)
-                    .frame(width: ring, height: ring)
-                    .position(head)
-                Circle()
-                    .fill(g.listening ? Color.orange : Color.accentColor)
-                    .frame(width: 16, height: 16)
-                    .overlay(Circle().stroke(Color.white, lineWidth: 2))
-                    .shadow(radius: 4)
-                    .position(head)
             }
         }
-        .clipped()
+    }
+
+    /// Places each saved screen where it really is: left or right by which way you turn to see it,
+    /// higher up if you look up at it. The MacBook sits on the desk; monitors stand behind it.
+    private func layout(size: CGSize, deskY: CGFloat) -> [Item] {
+        let saved = g.screens.compactMap { s in g.directions[s.key].map { (s, $0) } }
+        guard !saved.isEmpty else { return [] }
+        let yaws = saved.map(\.1.yaw)
+        let minYaw = yaws.min() ?? 0, maxYaw = yaws.max() ?? 0
+        let spread = max(1, maxYaw - minYaw)
+        let pitches = saved.map(\.1.pitch)
+        let maxPitch = pitches.max() ?? 0
+        return saved.map { s, d in
+            // Turning left is a bigger yaw, so it goes further left
+            let t = CGFloat(saved.count == 1 ? 0.5 : (maxYaw - d.yaw) / spread)
+            let x = size.width * (0.27 + 0.46 * t)
+            let lit = !g.spotlight || g.activeScreen == nil || g.activeScreen == s.key || !g.isOn
+            if s.isBuiltIn {
+                let w = size.width * 0.36, h = w * 0.6
+                return Item(screen: s, rect: CGRect(x: x - w / 2, y: deskY - h, width: w, height: h), lit: lit)
+            } else {
+                let w = size.width * 0.5, h = w * 0.6
+                let lift = CGFloat(max(0.0, min(1.0, (maxPitch - d.pitch) / 20)))   // lower if you look down at it
+                let top = size.height * (0.06 + 0.10 * lift)
+                return Item(screen: s, rect: CGRect(x: x - w / 2, y: top, width: w, height: h), lit: lit)
+            }
+        }
     }
 }
 
-// MARK: - Settings panel
-
-struct SettingsPanel: View {
-    @EnvironmentObject var g: Glance
+/// A screen showing a couple of windows, dimmed when you're not looking at it.
+struct ScreenContent: View {
+    let lit: Bool
+    let dim: Double
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
-                Text("Settings").font(.title3.weight(.semibold))
-
-                section("Cursor follows your eyes", "eye")
-                Toggle("Move the cursor to the screen you look at", isOn: $g.followCursor)
-                Picker("Switch", selection: $g.autoSwitch) {
-                    Text("Automatically").tag(true)
-                    Text("Only holding ⌃ ⌥").tag(false)
+        GeometryReader { geo in
+            let w = geo.size.width, h = geo.size.height
+            ZStack(alignment: .topLeading) {
+                LinearGradient(colors: [Color(red: 0.95, green: 0.96, blue: 0.98), Color(red: 0.86, green: 0.9, blue: 0.95)],
+                               startPoint: .topLeading, endPoint: .bottomTrailing)
+                Rectangle().fill(Color(red: 0.89, green: 0.91, blue: 0.95)).frame(height: max(4, h * 0.08))
+                HStack(spacing: 2) {
+                    Circle().fill(Color(red: 1, green: 0.37, blue: 0.34))
+                    Circle().fill(Color(red: 1, green: 0.74, blue: 0.18))
+                    Circle().fill(Color(red: 0.16, green: 0.78, blue: 0.25))
                 }
-                .pickerStyle(.segmented)
-                slider("Look time", $g.dwell, 0...1.5, step: 0.05, format: { String(format: "%.2f s", $0) },
-                       hint: "How long you must look at a screen before switching. Longer means quick glances are ignored.")
-                slider("Aim", $g.tolerance, 10...45, step: 1, format: { "\(Int($0))°" },
-                       hint: "How close to a screen you must look. Smaller means more precise.")
+                .frame(width: max(9, h * 0.13), height: max(3, h * 0.04))
+                .offset(x: w * 0.03, y: h * 0.02)
+                RoundedRectangle(cornerRadius: 2).fill(.white.opacity(0.85))
+                    .frame(width: w * 0.2, height: h * 0.8).offset(x: w * 0.03, y: h * 0.13)
+                RoundedRectangle(cornerRadius: 2).fill(.white)
+                    .frame(width: w * 0.71, height: h * 0.8).offset(x: w * 0.26, y: h * 0.13)
+                VStack(alignment: .leading, spacing: max(2, h * 0.04)) {
+                    Capsule().fill(Color.black.opacity(0.7)).frame(width: w * 0.42, height: max(2, h * 0.04))
+                    ForEach(0..<4, id: \.self) { i in
+                        Capsule().fill(Color(red: 0.8, green: 0.84, blue: 0.88))
+                            .frame(width: w * (i == 3 ? 0.4 : 0.62), height: max(1.5, h * 0.025))
+                    }
+                    HStack(spacing: w * 0.02) {
+                        RoundedRectangle(cornerRadius: 2).fill(Color(white: 0.18)).frame(width: w * 0.3, height: h * 0.3)
+                        RoundedRectangle(cornerRadius: 2).fill(Color(red: 0.93, green: 0.94, blue: 0.96)).frame(width: w * 0.32, height: h * 0.3)
+                    }
+                }
+                .offset(x: w * 0.29, y: h * 0.19)
+                Rectangle().fill(Color.black.opacity(lit ? 0 : max(0.35, dim)))
+                    .animation(.easeOut(duration: 0.3), value: lit)
+            }
+        }
+    }
+}
+
+struct MonitorView: View {
+    let lit: Bool
+    let dim: Double
+    let looking: Bool
+    /// How far below the screen's top edge the desk is, for the stand
+    let deskY: CGFloat
+
+    var body: some View {
+        GeometryReader { geo in
+            let w = geo.size.width, h = geo.size.height
+            ZStack(alignment: .topLeading) {
+                // Arm down to the desk, at the back right
+                Rectangle().fill(Color(white: 0.12))
+                    .frame(width: 7, height: max(0, deskY - h * 0.55))
+                    .offset(x: w * 0.85, y: h * 0.55)
+                Ellipse().fill(Color(white: 0.08))
+                    .frame(width: 60, height: 10)
+                    .offset(x: w * 0.85 - 27, y: deskY - 5)
+                RoundedRectangle(cornerRadius: 5, style: .continuous).fill(Color(white: 0.07))
+                ScreenContent(lit: lit, dim: dim)
+                    .clipShape(RoundedRectangle(cornerRadius: 1.5))
+                    .padding(.horizontal, 5).padding(.top, 5).padding(.bottom, 9)
+                Text("DELL").font(.system(size: 5, weight: .semibold)).tracking(0.6).foregroundStyle(Color(white: 0.45))
+                    .frame(width: w).offset(y: h - 8)
+                if looking {
+                    RoundedRectangle(cornerRadius: 4).strokeBorder(Color.accentColor, lineWidth: 2.5).padding(-2)
+                }
+            }
+        }
+    }
+}
+
+struct LaptopView: View {
+    let lit: Bool
+    let dim: Double
+    let looking: Bool
+
+    var body: some View {
+        GeometryReader { geo in
+            let w = geo.size.width, h = geo.size.height
+            let lid = h * 0.85
+            ZStack(alignment: .topLeading) {
+                RoundedRectangle(cornerRadius: 5, style: .continuous).fill(Color(white: 0.1))
+                    .frame(width: w * 0.92, height: lid).offset(x: w * 0.04)
+                ScreenContent(lit: lit, dim: dim)
+                    .clipShape(RoundedRectangle(cornerRadius: 1.5))
+                    .frame(width: w * 0.92 - 10, height: lid - 10).offset(x: w * 0.04 + 5, y: 5)
+                if looking {
+                    RoundedRectangle(cornerRadius: 5).strokeBorder(Color.accentColor, lineWidth: 2.5)
+                        .frame(width: w * 0.92 + 4, height: lid + 4).offset(x: w * 0.04 - 2, y: -2)
+                }
+                Path { p in
+                    p.move(to: CGPoint(x: w * 0.04, y: lid))
+                    p.addLine(to: CGPoint(x: w * 0.96, y: lid))
+                    p.addLine(to: CGPoint(x: w, y: h * 0.96))
+                    p.addLine(to: CGPoint(x: 0, y: h * 0.96))
+                    p.closeSubpath()
+                }
+                .fill(LinearGradient(colors: [Color(white: 0.45), Color(white: 0.3)], startPoint: .top, endPoint: .bottom))
+                Rectangle().fill(Color(white: 0.22)).frame(width: w, height: h * 0.04).offset(y: h * 0.96)
+            }
+        }
+    }
+}
+
+struct HeadView: View {
+    /// Degrees, positive turns to the right
+    let turn: Double
+    let airpods: Bool
+
+    var body: some View {
+        GeometryReader { geo in
+            let w = geo.size.width, h = geo.size.height
+            let shift = CGFloat(turn) * 0.35
+            let skin = LinearGradient(colors: [Color(red: 0.48, green: 0.3, blue: 0.2), Color(red: 0.37, green: 0.23, blue: 0.15)],
+                                      startPoint: .leading, endPoint: .trailing)
+            ZStack(alignment: .topLeading) {
+                // Shoulders and neck
+                Path { p in
+                    p.move(to: CGPoint(x: 0, y: h))
+                    p.addCurve(to: CGPoint(x: w / 2, y: h * 0.7), control1: CGPoint(x: w * 0.02, y: h * 0.76), control2: CGPoint(x: w * 0.25, y: h * 0.7))
+                    p.addCurve(to: CGPoint(x: w, y: h), control1: CGPoint(x: w * 0.75, y: h * 0.7), control2: CGPoint(x: w * 0.98, y: h * 0.76))
+                    p.closeSubpath()
+                }
+                .fill(LinearGradient(colors: [Color(red: 0.18, green: 0.23, blue: 0.3), Color(red: 0.12, green: 0.15, blue: 0.2)],
+                                     startPoint: .top, endPoint: .bottom))
+                Rectangle().fill(skin).frame(width: w * 0.22, height: h * 0.16).offset(x: w * 0.39, y: h * 0.58)
+                // Ears
+                Ellipse().fill(skin).frame(width: w * 0.1, height: h * 0.17)
+                    .offset(x: w * 0.17 + shift * 0.5, y: h * 0.33)
+                Ellipse().fill(skin).frame(width: w * 0.08 + shift * 0.002, height: h * 0.15)
+                    .offset(x: w * 0.73 + shift * 0.5, y: h * 0.33)
+                // Head
+                Ellipse()
+                    .fill(RadialGradient(colors: [Color(red: 0.18, green: 0.13, blue: 0.1), Color(red: 0.06, green: 0.04, blue: 0.03)],
+                                         center: UnitPoint(x: CGFloat(0.5 + turn / 120), y: 0.35), startRadius: 2, endRadius: w * 0.5))
+                    .frame(width: w * 0.62, height: h * 0.64)
+                    .rotationEffect(.degrees(turn * 0.5))
+                    .offset(x: w * 0.19 + shift * 0.3, y: h * 0.04)
+                // AirPods Pro
+                if airpods {
+                    airpod.offset(x: w * 0.17 + shift * 0.5, y: h * 0.37)
+                    airpod.scaleEffect(0.85).offset(x: w * 0.76 + shift * 0.5, y: h * 0.36)
+                }
+            }
+        }
+    }
+
+    private var airpod: some View {
+        VStack(spacing: -1) {
+            Ellipse().fill(Color(white: 0.97)).frame(width: 9, height: 10)
+            Capsule().fill(Color(white: 0.97)).frame(width: 4.5, height: 17)
+        }
+        .shadow(color: .black.opacity(0.3), radius: 1, y: 1)
+    }
+}
+
+// MARK: - Settings window
+
+enum SettingsPage: String, CaseIterable, Identifiable {
+    case general = "General", cursor = "Cursor", spotlight = "Spotlight", privacy = "Privacy", lights = "Lights", airpods = "AirPods"
+    var id: String { rawValue }
+    var symbol: String {
+        switch self {
+        case .general: return "gearshape.fill"
+        case .cursor: return "cursorarrow"
+        case .spotlight: return "sun.max.fill"
+        case .privacy: return "lock.fill"
+        case .lights: return "lightbulb.fill"
+        case .airpods: return "airpodspro"
+        }
+    }
+    var colour: Color {
+        switch self {
+        case .general: return .gray
+        case .cursor: return .blue
+        case .spotlight: return .orange
+        case .privacy: return .indigo
+        case .lights: return .yellow
+        case .airpods: return .green
+        }
+    }
+}
+
+struct SettingsView: View {
+    @EnvironmentObject var g: Glance
+    @State private var page: SettingsPage? = .general
+
+    var body: some View {
+        NavigationSplitView {
+            List(SettingsPage.allCases, selection: $page) { p in
+                Label {
+                    Text(p.rawValue)
+                } icon: {
+                    Image(systemName: p.symbol)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(p == .lights ? Color.black.opacity(0.8) : .white)
+                        .frame(width: 22, height: 22)
+                        .background(p.colour, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                }
+                .tag(p)
+            }
+            .navigationSplitViewColumnWidth(190)
+        } detail: {
+            Form { detail(page ?? .general) }
+                .formStyle(.grouped)
+                .navigationTitle(page?.rawValue ?? "General")
+        }
+        .frame(minWidth: 680, minHeight: 480)
+    }
+
+    @ViewBuilder private func detail(_ p: SettingsPage) -> some View {
+        switch p {
+        case .general: general
+        case .cursor: cursor
+        case .spotlight: spotlight
+        case .privacy: privacy
+        case .lights: lights
+        case .airpods: airpods
+        }
+    }
+
+    // MARK: Pages
+
+    @ViewBuilder private var general: some View {
+        Section {
+            Toggle(isOn: $g.isOn) { row("Glance on", "Turn everything on or off. Shortcut: ⌃ ⌥ G") }
+        }
+        Section("Shortcuts") {
+            LabeledContent("Turn Glance on or off", value: "⌃ ⌥ G")
+            LabeledContent("Recentre", value: "⌃ ⌥ R")
+            LabeledContent("Show your screens again", value: "Hold ⌃ ⌥")
+        }
+        Section {
+            LabeledContent {
+                Button("Reset", role: .destructive) { g.resetSettings() }
+            } label: {
+                row("Reset to defaults", "Puts every setting back to how it started. Your saved screens are kept.")
+            }
+        }
+    }
+
+    @ViewBuilder private var cursor: some View {
+        Section {
+            Toggle(isOn: $g.followCursor) { row("Move the cursor to the screen you look at", "The cursor jumps to the screen you're facing") }
+            Picker("Switch screens", selection: $g.autoSwitch) {
+                Text("Automatically").tag(true)
+                Text("Only while holding ⌃ ⌥").tag(false)
+            }
+            Toggle(isOn: $g.nodEnabled) { row("Nod to focus", "Hold ⌃ ⌥ and nod to bring the window to the front") }
+            Toggle(isOn: $g.throwEnabled) { row("Move windows by looking", "Hold ⌃ ⌥ ⌘ and look at another screen to move the front window there") }
+        }
+        Section {
+            DisclosureGroup("More options") {
+                slider("Look time", $g.dwell, 0...1.5, step: 0.05, String(format: "%.2f s", g.dwell),
+                       "How long you look at a screen before switching. Longer ignores quick glances.")
+                slider("Aim", $g.tolerance, 10...45, step: 1, "\(Int(g.tolerance))°",
+                       "How close to a screen you must look. Smaller is more precise.")
+                slider("Nod size", $g.nodSize, 3...15, step: 1, "\(Int(g.nodSize))°",
+                       "How far your head must dip for a nod.")
                 Toggle("Return to where the cursor was on that screen", isOn: $g.rememberPosition)
                 Toggle("Make the window there ready for typing", isOn: $g.focusOnSwitch)
+            }
+        }
+    }
 
-                section("Nod to focus", "arrow.down.circle")
-                Toggle("Hold ⌃ ⌥ and nod to bring the window to the front", isOn: $g.nodEnabled)
-                slider("Nod size", $g.nodSize, 3...15, step: 1, format: { "\(Int($0))°" },
-                       hint: "How far your head must dip. Smaller means a smaller nod counts.")
-
-                section("Move windows", "macwindow.on.rectangle")
-                Toggle("Hold ⌃ ⌥ ⌘ and look at another screen to move the front window there", isOn: $g.throwEnabled)
-
-                section("Spotlight", "sun.max")
-                Toggle("Dim the screens you're not looking at", isOn: $g.spotlight)
+    @ViewBuilder private var spotlight: some View {
+        Section {
+            Toggle(isOn: $g.spotlight) { row("Dim screens you're not looking at", "The screen you face stays bright") }
+            slider("Dim amount", $g.spotlightStrength, 0.1...0.8, step: 0.05, "\(Int(g.spotlightStrength * 100))%", nil)
+            LabeledContent("Try it on your screens") { Button("Test dimming") { g.testDim() } }
+        } footer: {
+            Text(spotStatus).font(.caption).foregroundStyle(.secondary)
+        }
+        Section {
+            DisclosureGroup("More options") {
                 Picker("Dim by", selection: $g.gammaDim) {
                     Text("Darkening colours").tag(true)
                     Text("Dark layer").tag(false)
                 }
                 .pickerStyle(.segmented)
-                Text("Darkening colours works best on external monitors like Dell. Try the other if one doesn't work.")
-                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                slider("Dim amount", $g.spotlightStrength, 0.1...0.8, step: 0.05, format: { "\(Int($0 * 100))%" },
-                       hint: "How dark the other screens go.")
-                Text(spotStatus).font(.caption).foregroundStyle(.secondary)
-                Button("Test dimming") { g.testDim() }
-                    .help("Darkens every screen except the one with the cursor for 2 seconds")
-
-                section("Privacy", "lock.shield")
-                Toggle("Hide my screens when I look away", isOn: $g.privacy)
-                slider("Away time", $g.awaySeconds, 3...60, step: 1, format: { "\(Int($0)) s" },
-                       hint: "How long you can look away before your screens are hidden.")
-                Picker("When away", selection: $g.sleepDisplay) {
-                    Text("Blur screens").tag(false)
-                    Text("Turn screens off").tag(true)
-                }
-                .pickerStyle(.segmented)
-                slider("Cover strength", $g.privacyStrength, 0.3...1, step: 0.05, format: { "\(Int($0 * 100))%" },
-                       hint: "100% hides everything completely.")
-                Text("Taking your AirPods out pauses Glance, so your screens always work while they're charging.")
-                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                Text("Holding ⌃ ⌥ always shows your screens again.").font(.caption).foregroundStyle(.secondary)
-
-                section("Lights (Look and Nod)", "lightbulb")
-                Toggle("Switch my lights off when I leave my desk", isOn: $g.lightsEnabled)
-                if g.lightsEnabled {
-                    Picker("Which light", selection: $g.lightTarget) {
-                        Text("All lights").tag("all")
-                        ForEach(g.bridgeLights) { l in Text(l.label).tag(l.name) }
-                    }
-                    slider("Leave after", $g.leaveSeconds, 2...300, step: 1,
-                           format: { $0 < 60 ? "\(Int($0)) s" : String(format: "%d min %02d s", Int($0) / 60, Int($0) % 60) },
-                           hint: "How long you must look away from your screens before the lights go off. Short is instant, but a long glance away also counts.")
-                    Toggle("Switch them back on when I return", isOn: $g.lightsBackOn)
-                    Picker("Only when it's dark", selection: $g.darkMode) {
-                        Text("Sunset to sunrise").tag(0)
-                        Text("Set hours").tag(1)
-                        Text("Any time").tag(2)
-                    }
-                    if g.darkMode == 0 {
-                        slider("Start early", $g.sunOffset, 0...90, step: 5, format: { "\(Int($0)) min" },
-                               hint: "Counts as dark this long before sunset and after sunrise, for gloomy evenings.")
-                    } else if g.darkMode == 1 {
-                        Stepper(String(format: "Dark from %02d:00", Int(g.startHour)), value: $g.startHour, in: 0...23)
-                        Stepper(String(format: "Until %02d:00", Int(g.endHour)), value: $g.endHour, in: 0...23)
-                    }
-                    Text("\(g.darkSummary) · \(g.isDark ? "It's dark now" : "It's light now")")
-                        .font(.caption).foregroundStyle(.secondary)
-                    HStack(spacing: 6) {
-                        Circle().fill(g.bridgeOnline ? Color.green : Color.orange).frame(width: 7, height: 7)
-                        Text(g.bridgeOnline ? "Bridge running · \(g.bridgeLights.count) light(s)" : "Bridge not running")
-                            .font(.caption)
-                    }
-                    Text(g.lightNote).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                    Button("Test lights") { g.testLights() }
-                        .help("Switches the chosen lights off, then back on after 3 seconds")
-                }
-
-                Divider()
-                Button("Reset to defaults") { g.resetSettings() }
+                Text("Darkening colours works best on external monitors. Try Dark layer if one doesn't dim.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
-            .padding(18)
         }
-        .frame(width: 360, height: 620)
+    }
+
+    @ViewBuilder private var privacy: some View {
+        Section {
+            Toggle(isOn: $g.privacy) { row("Hide my screens when I look away", "Nobody can read over your shoulder while you're turned away") }
+            slider("Away time", $g.awaySeconds, 3...60, step: 1, "\(Int(g.awaySeconds)) s",
+                   "How long you can look away before your screens hide.")
+            Picker("When away", selection: $g.sleepDisplay) {
+                Text("Blur screens").tag(false)
+                Text("Turn screens off").tag(true)
+            }
+        } footer: {
+            Text("Holding ⌃ ⌥ always shows your screens again.").font(.caption).foregroundStyle(.secondary)
+        }
+        Section {
+            DisclosureGroup("More options") {
+                slider("Cover strength", $g.privacyStrength, 0.3...1, step: 0.05, "\(Int(g.privacyStrength * 100))%",
+                       "100% hides everything completely.")
+            }
+        }
+    }
+
+    @ViewBuilder private var lights: some View {
+        Section {
+            LabeledContent {
+                if g.bridgeOnline {
+                    Button("Test lights") { g.testLights() }
+                } else {
+                    Button("Start bridge") { g.startBridge() }
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Circle().fill(g.bridgeOnline ? Color.green : Color.orange).frame(width: 8, height: 8)
+                    row(g.bridgeOnline ? "Bridge running" : "Bridge not running",
+                        g.bridgeOnline ? "\(g.bridgeLights.count) light(s) found" : "Glance needs Look and Nod's bridge to reach your lights")
+                }
+            }
+        } footer: {
+            Text(g.lightNote).font(.caption).foregroundStyle(.secondary)
+        }
+        Section {
+            Toggle(isOn: $g.lightsEnabled) { row("Switch my lights off when I leave my desk", "And back on when you return") }
+            if g.lightsEnabled {
+                Picker("Which light", selection: $g.lightTarget) {
+                    Text("All lights").tag("all")
+                    ForEach(g.bridgeLights) { l in Text(l.label).tag(l.name) }
+                }
+                slider("Leave after", $g.leaveSeconds, 2...300, step: 1, leaveText,
+                       "How long you look away from your screens before the lights go off.")
+                Toggle("Switch them back on when I return", isOn: $g.lightsBackOn)
+            }
+        }
+        if g.lightsEnabled {
+            Section {
+                Picker("Only when it's dark", selection: $g.darkMode) {
+                    Text("Sunset to sunrise").tag(0)
+                    Text("Set hours").tag(1)
+                    Text("Any time").tag(2)
+                }
+                if g.darkMode == 0 {
+                    slider("Start early", $g.sunOffset, 0...90, step: 5, "\(Int(g.sunOffset)) min",
+                           "Counts as dark this long before sunset and after sunrise.")
+                } else if g.darkMode == 1 {
+                    Stepper(String(format: "Dark from %02d:00", Int(g.startHour)), value: $g.startHour, in: 0...23)
+                    Stepper(String(format: "Until %02d:00", Int(g.endHour)), value: $g.endHour, in: 0...23)
+                }
+            } footer: {
+                Text("\(g.darkSummary) · \(g.isDark ? "It's dark now" : "It's light now")").font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    @ViewBuilder private var airpods: some View {
+        Section {
+            LabeledContent("AirPods") {
+                Text(!g.airpods ? "Not connected" : (g.worn ? "In your ears" : "Out"))
+                    .foregroundStyle(g.airpods && g.worn ? Color.green : Color.secondary)
+            }
+            LabeledContent {
+                Button("Recentre") { g.recentreFromShortcut() }
+            } label: {
+                row("Recentre", "Face your main screen and press this. Shortcut: ⌃ ⌥ R")
+            }
+        } footer: {
+            Text("Taking your AirPods out pauses Glance, so your screens always work while they're charging. If they're out for a short time, Glance carries on by itself when you put them back.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: Helpers
+
+    private var leaveText: String {
+        let v = g.leaveSeconds
+        return v < 60 ? "\(Int(v)) s" : String(format: "%d min %02d s", Int(v) / 60, Int(v) % 60)
     }
 
     private var spotStatus: String {
         guard let a = g.activeScreen, let bright = g.screens.first(where: { $0.key == a }) else {
-            return "Spotlight: waiting until you look at a saved screen."
+            return "Right now: waiting until you look at a saved screen."
         }
         let dimmed = g.screens.filter { $0.key != a }.map(\.name).joined(separator: ", ")
-        return "Spotlight now: \(bright.name) bright" + (dimmed.isEmpty ? "" : ", \(dimmed) dimmed")
+        return "Right now: \(bright.name) bright" + (dimmed.isEmpty ? "." : ", \(dimmed) dimmed.")
     }
 
-    private func section(_ title: String, _ symbol: String) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Divider()
-            Label(title, systemImage: symbol).font(.subheadline.weight(.semibold))
+    private func row(_ title: String, _ detail: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+            Text(detail).font(.caption).foregroundStyle(.secondary)
         }
     }
 
     private func slider(_ title: String, _ value: Binding<Double>, _ range: ClosedRange<Double>, step: Double,
-                        format: @escaping (Double) -> String, hint: String) -> some View {
+                        _ shown: String, _ hint: String?) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
                 Text(title)
-                Spacer()
-                Text(format(value.wrappedValue)).monospacedDigit().foregroundStyle(.secondary)
+                Slider(value: value, in: range, step: step).labelsHidden()
+                Text(shown).monospacedDigit().foregroundStyle(.secondary).frame(minWidth: 64, alignment: .trailing)
             }
-            Slider(value: value, in: range, step: step)
-            Text(hint).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            if let hint { Text(hint).font(.caption).foregroundStyle(.secondary) }
         }
     }
 }
@@ -382,6 +831,11 @@ struct MenuContent: View {
             openWindow(id: "main")
             NSApp.activate(ignoringOtherApps: true)
         }
+        Button("Settings…") {
+            openWindow(id: "settings")
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        Divider()
         Button("Quit Glance") { NSApp.terminate(nil) }
     }
 }
