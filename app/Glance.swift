@@ -525,6 +525,12 @@ final class Glance: ObservableObject {
         return on ? spotlightStrength : 0
     }
 
+    /// How dark a screen's colours should be: the privacy cover wins over the spotlight.
+    private func colourTarget(_ key: String) -> Double {
+        if hidden { return max(0.85, privacyStrength) }
+        return gammaDim ? Double(spotTarget(key)) : 0
+    }
+
     private func updateDim() {
         guard !testingDim else { return }
         for s in screens { dimScreen(s.key, spotTarget(s.key)) }
@@ -533,10 +539,11 @@ final class Glance: ObservableObject {
     /// Dims one screen using whichever method is chosen in settings.
     private func dimScreen(_ key: String, _ target: CGFloat) {
         if gammaDim {
-            setGamma(key, Double(target))
+            setGamma(key, hidden ? colourTarget(key) : Double(target))
             if let w = dimWindows[key], w.alphaValue > 0 { setDim(w, 0) }
         } else {
-            setGamma(key, 0)
+            // The privacy cover also darkens colours, so it works on monitors where the layer doesn't show
+            setGamma(key, hidden ? colourTarget(key) : 0)
             if let w = dimWindows[key] { setDim(w, target) }
         }
     }
@@ -577,7 +584,8 @@ final class Glance: ObservableObject {
 
     private func applyGamma(_ key: String, _ amount: Double) {
         guard let s = screens.first(where: { $0.key == key }), s.displayID != 0 else { return }
-        let top = CGGammaValue(max(0.15, 1 - amount))
+        // The spotlight never goes below 15% so you can still see; the privacy cover can go fully dark
+        let top = CGGammaValue(max(hidden ? 0 : 0.15, 1 - amount))
         CGSetDisplayTransferByFormula(s.displayID, 0, top, 1, 0, top, 1, 0, top, 1)
     }
 
@@ -585,10 +593,10 @@ final class Glance: ObservableObject {
     /// macOS sometimes hides or moves these layers when apps switch or Spaces change.
     private func enforceDim() {
         guard !testingDim else { return }
-        if gammaDim {
+        if gammaDim || hidden {
             // Night Shift or True Tone can reset the colours, so put the dimming back
             for s in screens {
-                let target = Double(spotTarget(s.key))
+                let target = colourTarget(s.key)
                 if gammaGoal[s.key] != target { setGamma(s.key, target) }
                 else if fadeTimer == nil, let now = gammaNow[s.key], now > 0 { applyGamma(s.key, now) }
             }
