@@ -161,11 +161,13 @@ struct DeskMap: View {
             let size = geo.size
             let c = CGPoint(x: size.width / 2, y: size.height / 2)
             let saved = g.screens.compactMap { s in g.directions[s.key].map { Placed(screen: s, dir: $0) } }
-            let extent = max(30, saved.map { max(abs($0.dir.yaw), abs($0.dir.pitch)) }.max() ?? 30)
-            let scale = max(1, min(8, (min(size.width, size.height) / 2 - 90) / extent))
+            let extent: Double = max(30, saved.map { max(abs($0.dir.yaw), abs($0.dir.pitch)) }.max() ?? 30)
+            let half: Double = Double(min(size.width, size.height)) / 2
+            let scale: Double = max(1, min(8, (half - 90) / extent))
             let point: (Double, Double) -> CGPoint = { yaw, pitch in
-                CGPoint(x: c.x - yaw * scale, y: c.y - pitch * scale)
+                CGPoint(x: Double(c.x) - yaw * scale, y: Double(c.y) - pitch * scale)
             }
+            let ring = CGFloat(g.tolerance * scale * 2)
             ZStack {
                 VStack {
                     HStack {
@@ -214,7 +216,7 @@ struct DeskMap: View {
                 let head = point(g.yaw, g.pitch)
                 Circle()
                     .stroke(Color.accentColor.opacity(0.25), lineWidth: 1)
-                    .frame(width: g.tolerance * scale * 2, height: g.tolerance * scale * 2)
+                    .frame(width: ring, height: ring)
                     .position(head)
                 Circle()
                     .fill(g.listening ? Color.orange : Color.accentColor)
