@@ -36,7 +36,7 @@ enum Setting {
     static let doubles: [String: Double] = [
         "dwell": 0.35, "tolerance": 25, "nodSize": 5, "spotlightStrength": 0.45,
         "awaySeconds": 10, "privacyStrength": 0.85,
-        "leaveMinutes": 2, "sunOffset": 30, "startHour": 18, "endHour": 7, "darkMode": 0,
+        "leaveSeconds": 5, "sunOffset": 30, "startHour": 18, "endHour": 7, "darkMode": 0,
     ]
     static let bools: [String: Bool] = [
         "isOn": true, "followCursor": true, "autoSwitch": true, "rememberPosition": true,
@@ -157,7 +157,8 @@ final class Glance: NSObject, ObservableObject, CMHeadphoneMotionManagerDelegate
     // Lights (works with Look and Nod's bulb bridge)
     @Published var lightsEnabled = Setting.b("lightsEnabled") { didSet { Pref.set(lightsEnabled, "lightsEnabled") } }
     @Published var lightsBackOn = Setting.b("lightsBackOn") { didSet { Pref.set(lightsBackOn, "lightsBackOn") } }
-    @Published var leaveMinutes = Setting.d("leaveMinutes") { didSet { Pref.set(leaveMinutes, "leaveMinutes") } }
+    /// How long you must be away from your screens before the lights go off
+    @Published var leaveSeconds = Setting.d("leaveSeconds") { didSet { Pref.set(leaveSeconds, "leaveSeconds") } }
     /// 0 = sunset to sunrise, 1 = set hours, 2 = any time
     @Published var darkMode = Int(Setting.d("darkMode")) { didSet { Pref.set(Double(darkMode), "darkMode") } }
     @Published var sunOffset = Setting.d("sunOffset") { didSet { Pref.set(sunOffset, "sunOffset") } }
@@ -767,7 +768,8 @@ final class Glance: NSObject, ObservableObject, CMHeadphoneMotionManagerDelegate
         if t != trusted { trusted = t }
         let live = Date().timeIntervalSince(lastMotion) < 2
         if live != airpods { airpods = live }
-        if !live && worn { setWorn(false) }
+        // Short gaps in the motion data happen (Bluetooth hiccups, audio switching). Only pause after a long one.
+        if worn, Date().timeIntervalSince(lastMotion) > 10 { setWorn(false) }
 
         // Never hide the screens while your AirPods are out or Glance is waiting for a recentre
         guard active, privacy, live, !needsRecentre else {
@@ -841,13 +843,23 @@ final class Glance: NSObject, ObservableObject, CMHeadphoneMotionManagerDelegate
         lightTicks += 1
 
         let live = Date().timeIntervalSince(lastMotion) < 2
+
+        // Coming back: you look at a screen again, or your AirPods come back within range of the Mac.
+        // This doesn't wait for a recentre, so the lights come on the moment you return.
+        if awayHandled, lightsEnabled, isOn, live, worn, facing != nil || needsRecentre {
+            awayHandled = false
+            leftSince = nil
+            lightsOnForReturn()
+            return
+        }
+
         guard lightsEnabled, active, live, hasRecentred, !needsRecentre, !directions.isEmpty else {
             leftSince = nil
             return
         }
         if facing == nil {
             if leftSince == nil { leftSince = Date() }
-            if !awayHandled, let since = leftSince, Date().timeIntervalSince(since) >= leaveMinutes * 60 {
+            if !awayHandled, let since = leftSince, Date().timeIntervalSince(since) >= leaveSeconds {
                 awayHandled = true
                 if isDark {
                     lightsOffForAway()
@@ -857,10 +869,6 @@ final class Glance: NSObject, ObservableObject, CMHeadphoneMotionManagerDelegate
             }
         } else {
             leftSince = nil
-            if awayHandled {
-                awayHandled = false
-                lightsOnForReturn()
-            }
         }
     }
 
@@ -932,34 +940,50 @@ final class Glance: NSObject, ObservableObject, CMHeadphoneMotionManagerDelegate
     // MARK: AirPods in or out
 
     private var wornSamples: [(t: Double, y: Double, p: Double, r: Double)] = []
+    /// When the AirPods were last taken out, and whether they disconnected (back in the case)
+    private var outAt: Date?
+    private var outByDisconnect = false
 
-    /// AirPods lying on a desk or in an open case are perfectly still. A head never is.
+    /// AirPods lying on a desk or in an open case are perfectly still. A head never is, not for 20 seconds.
+    /// (Sitting still reading for a few seconds used to count as "out", which paused Glance by mistake.)
+    private static let stillSeconds = 20.0
     private func checkWorn(t: Double, yaw: Double, pitch: Double, roll: Double) {
         wornSamples.append((t, yaw, pitch, roll))
-        wornSamples.removeAll { t - $0.t > 4 }
-        guard let first = wornSamples.first, t - first.t >= 3 else { return }
+        wornSamples.removeAll { t - $0.t > Self.stillSeconds }
         func range(_ v: [Double]) -> Double { (v.max() ?? 0) - (v.min() ?? 0) }
-        let ys = wornSamples.map { wrapAngle($0.y - first.y) }
-        let moved = max(range(ys), range(wornSamples.map { $0.p }), range(wornSamples.map { $0.r }))
-        if worn, moved < 0.35 {
-            setWorn(false)
-        } else if !worn, moved > 0.9 || range(wornSamples.suffix(10).map { $0.p }) > 0.8 {
-            setWorn(true)
+        func moved(_ w: ArraySlice<(t: Double, y: Double, p: Double, r: Double)>) -> Double {
+            guard let f = w.first else { return 0 }
+            return max(range(w.map { wrapAngle($0.y - f.y) }), range(w.map { $0.p }), range(w.map { $0.r }))
+        }
+        guard let first = wornSamples.first else { return }
+        if worn {
+            // Out only after a long, completely still stretch
+            if t - first.t >= Self.stillSeconds - 0.5, moved(wornSamples[...]) < 0.2 { setWorn(false) }
+        } else {
+            // Back in as soon as there's real head movement in the last 3 seconds
+            let recent = wornSamples.drop { t - $0.t > 3 }
+            if moved(recent) > 0.9 { setWorn(true) }
         }
     }
 
-    private func setWorn(_ on: Bool) {
+    private func setWorn(_ on: Bool, disconnected: Bool = false) {
         guard on != worn else { return }
         worn = on
         wornSamples.removeAll()
         if on {
-            // Coming back: AirPods may have lost track of direction, so wait for a recentre
-            if hasRecentred {
+            // Only ask for a recentre if the AirPods really went back in the case, or were out for a while,
+            // because that's when they can lose their sense of direction. Otherwise just carry on.
+            let longOut = Date().timeIntervalSince(outAt ?? .distantPast) > 120
+            if hasRecentred && (outByDisconnect || longOut) {
                 needsRecentre = true
                 message = "AirPods back. Face your main screen and press Recentre (or ⌃ ⌥ R)."
                 showBanner("AirPods back", "Face your main screen and press ⌃ ⌥ R")
+            } else {
+                message = "Glance is on."
             }
+            outAt = nil; outByDisconnect = false
         } else {
+            outAt = Date(); outByDisconnect = disconnected
             setCover(false)
             awaySince = nil; slept = false
             activeScreen = nil
@@ -971,7 +995,10 @@ final class Glance: NSObject, ObservableObject, CMHeadphoneMotionManagerDelegate
     nonisolated func headphoneMotionManagerDidConnect(_ manager: CMHeadphoneMotionManager) {}
 
     nonisolated func headphoneMotionManagerDidDisconnect(_ manager: CMHeadphoneMotionManager) {
-        Task { @MainActor in self.setWorn(false); self.airpods = false }
+        Task { @MainActor in
+            if self.worn { self.setWorn(false, disconnected: true) } else { self.outByDisconnect = true }
+            self.airpods = false
+        }
     }
 
     // MARK: Keyboard shortcuts (work in every app)
@@ -1075,7 +1102,7 @@ final class Glance: NSObject, ObservableObject, CMHeadphoneMotionManagerDelegate
         awaySeconds = Setting.d("awaySeconds"); privacyStrength = Setting.d("privacyStrength")
         privacyWhenOut = Setting.b("privacyWhenOut"); sleepDisplay = Setting.b("sleepDisplay"); gammaDim = Setting.b("gammaDim")
         lightsEnabled = Setting.b("lightsEnabled"); lightsBackOn = Setting.b("lightsBackOn")
-        leaveMinutes = Setting.d("leaveMinutes"); darkMode = Int(Setting.d("darkMode")); sunOffset = Setting.d("sunOffset")
+        leaveSeconds = Setting.d("leaveSeconds"); darkMode = Int(Setting.d("darkMode")); sunOffset = Setting.d("sunOffset")
         startHour = Setting.d("startHour"); endHour = Setting.d("endHour")
     }
 

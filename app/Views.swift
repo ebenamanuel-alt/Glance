@@ -301,8 +301,9 @@ struct SettingsPanel: View {
                         Text("All lights").tag("all")
                         ForEach(g.bridgeLights) { l in Text(l.label).tag(l.name) }
                     }
-                    slider("Leave after", $g.leaveMinutes, 1...30, step: 1, format: { "\(Int($0)) min" },
-                           hint: "How long you must be away from your screens before the lights go off.")
+                    slider("Leave after", $g.leaveSeconds, 2...300, step: 1,
+                           format: { $0 < 60 ? "\(Int($0)) s" : String(format: "%d min %02d s", Int($0) / 60, Int($0) % 60) },
+                           hint: "How long you must look away from your screens before the lights go off. Short is instant, but a long glance away also counts.")
                     Toggle("Switch them back on when I return", isOn: $g.lightsBackOn)
                     Picker("Only when it's dark", selection: $g.darkMode) {
                         Text("Sunset to sunrise").tag(0)
