@@ -25,11 +25,7 @@ struct ContentView: View {
         .padding(20)
         .frame(minWidth: 920, minHeight: 580)
         .onAppear { g.start() }
-        // Touch Bar buttons, shown while the Glance window is in front
-        .touchBar {
-            Button(g.isOn ? "Glance: On" : "Glance: Off") { g.isOn.toggle() }
-            Button("Recentre") { g.recentre() }
-        }
+
     }
 
     // MARK: Header
@@ -297,6 +293,40 @@ struct SettingsPanel: View {
                 Text("Taking your AirPods out pauses Glance, so your screens always work while they're charging.")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 Text("Holding ⌃ ⌥ always shows your screens again.").font(.caption).foregroundStyle(.secondary)
+
+                section("Lights (Look and Nod)", "lightbulb")
+                Toggle("Switch my lights off when I leave my desk", isOn: $g.lightsEnabled)
+                if g.lightsEnabled {
+                    Picker("Which light", selection: $g.lightTarget) {
+                        Text("All lights").tag("all")
+                        ForEach(g.bridgeLights) { l in Text(l.label).tag(l.name) }
+                    }
+                    slider("Leave after", $g.leaveMinutes, 1...30, step: 1, format: { "\(Int($0)) min" },
+                           hint: "How long you must be away from your screens before the lights go off.")
+                    Toggle("Switch them back on when I return", isOn: $g.lightsBackOn)
+                    Picker("Only when it's dark", selection: $g.darkMode) {
+                        Text("Sunset to sunrise").tag(0)
+                        Text("Set hours").tag(1)
+                        Text("Any time").tag(2)
+                    }
+                    if g.darkMode == 0 {
+                        slider("Start early", $g.sunOffset, 0...90, step: 5, format: { "\(Int($0)) min" },
+                               hint: "Counts as dark this long before sunset and after sunrise, for gloomy evenings.")
+                    } else if g.darkMode == 1 {
+                        Stepper(String(format: "Dark from %02d:00", Int(g.startHour)), value: $g.startHour, in: 0...23)
+                        Stepper(String(format: "Until %02d:00", Int(g.endHour)), value: $g.endHour, in: 0...23)
+                    }
+                    Text("\(g.darkSummary) · \(g.isDark ? "It's dark now" : "It's light now")")
+                        .font(.caption).foregroundStyle(.secondary)
+                    HStack(spacing: 6) {
+                        Circle().fill(g.bridgeOnline ? Color.green : Color.orange).frame(width: 7, height: 7)
+                        Text(g.bridgeOnline ? "Bridge running · \(g.bridgeLights.count) light(s)" : "Bridge not running")
+                            .font(.caption)
+                    }
+                    Text(g.lightNote).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    Button("Test lights") { g.testLights() }
+                        .help("Switches the chosen lights off, then back on after 3 seconds")
+                }
 
                 Divider()
                 Button("Reset to defaults") { g.resetSettings() }

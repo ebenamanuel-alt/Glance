@@ -36,11 +36,13 @@ enum Setting {
     static let doubles: [String: Double] = [
         "dwell": 0.35, "tolerance": 25, "nodSize": 5, "spotlightStrength": 0.45,
         "awaySeconds": 10, "privacyStrength": 0.85,
+        "leaveMinutes": 2, "sunOffset": 30, "startHour": 18, "endHour": 7, "darkMode": 0,
     ]
     static let bools: [String: Bool] = [
         "isOn": true, "followCursor": true, "autoSwitch": true, "rememberPosition": true,
         "focusOnSwitch": true, "nodEnabled": true, "throwEnabled": true, "spotlight": true,
         "privacy": true, "privacyWhenOut": false, "sleepDisplay": false, "gammaDim": true,
+        "lightsEnabled": true, "lightsBackOn": true,
     ]
     static func d(_ key: String) -> Double { Pref.double(key, doubles[key] ?? 0) }
     static func b(_ key: String) -> Bool { Pref.bool(key, bools[key] ?? false) }
@@ -148,8 +150,25 @@ final class Glance: NSObject, ObservableObject, CMHeadphoneMotionManagerDelegate
             if !isOn { setCover(false) }
             updateDim()
             message = isOn ? "Glance is on." : "Glance is off. Your screens work as normal."
+            refreshTouchBar()
         }
     }
+
+    // Lights (works with Look and Nod's bulb bridge)
+    @Published var lightsEnabled = Setting.b("lightsEnabled") { didSet { Pref.set(lightsEnabled, "lightsEnabled") } }
+    @Published var lightsBackOn = Setting.b("lightsBackOn") { didSet { Pref.set(lightsBackOn, "lightsBackOn") } }
+    @Published var leaveMinutes = Setting.d("leaveMinutes") { didSet { Pref.set(leaveMinutes, "leaveMinutes") } }
+    /// 0 = sunset to sunrise, 1 = set hours, 2 = any time
+    @Published var darkMode = Int(Setting.d("darkMode")) { didSet { Pref.set(Double(darkMode), "darkMode") } }
+    @Published var sunOffset = Setting.d("sunOffset") { didSet { Pref.set(sunOffset, "sunOffset") } }
+    @Published var startHour = Setting.d("startHour") { didSet { Pref.set(startHour, "startHour") } }
+    @Published var endHour = Setting.d("endHour") { didSet { Pref.set(endHour, "endHour") } }
+    @Published var lightTarget = UserDefaults.standard.string(forKey: "lightTarget") ?? "all" {
+        didSet { UserDefaults.standard.set(lightTarget, forKey: "lightTarget") }
+    }
+    @Published var bridgeLights: [BridgeLight] = []
+    @Published var bridgeOnline = false
+    @Published var lightNote = "Waiting for the Look and Nod bridge."
 
     /// Everything Glance does needs it switched on and your AirPods in your ears.
     var active: Bool { isOn && worn }
@@ -229,7 +248,54 @@ final class Glance: NSObject, ObservableObject, CMHeadphoneMotionManagerDelegate
             MainActor.assumeIsolated { self?.tick() }
         }
         buildOverlays()
+        DispatchQueue.main.async { [weak self] in MainActor.assumeIsolated { self?.installTouchBar() } }
     }
+
+    // MARK: Touch Bar (Apple's AppKit method)
+    // The buttons show on the Touch Bar while Glance is the app in front.
+
+    private var bar: NSTouchBar?
+    private var toggleButton: NSButton?
+    private static let toggleID = NSTouchBarItem.Identifier("com.ebenamanuel.glance.toggle")
+    private static let recentreID = NSTouchBarItem.Identifier("com.ebenamanuel.glance.recentre")
+
+    private func makeTouchBar() -> NSTouchBar {
+        let toggle = NSCustomTouchBarItem(identifier: Self.toggleID)
+        let button = NSButton(title: "", target: self, action: #selector(touchBarToggle))
+        button.imagePosition = .imageLeading
+        toggle.view = button
+        toggleButton = button
+
+        let recentreItem = NSCustomTouchBarItem(identifier: Self.recentreID)
+        let recentreButton = NSButton(title: "Recentre", target: self, action: #selector(touchBarRecentre))
+        recentreButton.image = NSImage(systemSymbolName: "scope", accessibilityDescription: "Recentre")
+        recentreButton.imagePosition = .imageLeading
+        recentreItem.view = recentreButton
+
+        let b = NSTouchBar()
+        b.templateItems = [toggle, recentreItem]
+        b.defaultItemIdentifiers = [Self.toggleID, Self.recentreID]
+        bar = b
+        refreshTouchBar()
+        return b
+    }
+
+    /// Attaches the Touch Bar to the app and the Glance window. Safe to call often.
+    func installTouchBar() {
+        let b = bar ?? makeTouchBar()
+        if NSApp.touchBar !== b { NSApp.touchBar = b }
+        for w in NSApp.windows where w.title == "Glance" && w.touchBar !== b { w.touchBar = b }
+    }
+
+    private func refreshTouchBar() {
+        guard let button = toggleButton else { return }
+        button.title = isOn ? "Glance On" : "Glance Off"
+        button.image = NSImage(systemSymbolName: isOn ? "eye.fill" : "eye.slash", accessibilityDescription: nil)
+        button.bezelColor = isOn ? .systemBlue : nil
+    }
+
+    @objc private func touchBarToggle() { isOn.toggle() }
+    @objc private func touchBarRecentre() { recentreFromShortcut() }
 
     // MARK: Head movement
 
@@ -693,6 +759,8 @@ final class Glance: NSObject, ObservableObject, CMHeadphoneMotionManagerDelegate
 
     /// Runs four times a second: checks permissions and whether you've looked away.
     private func tick() {
+        installTouchBar()
+        lightsTick()
         if testingDim, Date() >= testEndsAt.addingTimeInterval(0.5) { testingDim = false }
         enforceDim()
         let t = AXIsProcessTrusted()
@@ -726,6 +794,138 @@ final class Glance: NSObject, ObservableObject, CMHeadphoneMotionManagerDelegate
             if !slept { slept = true; sleepScreens() }
         } else if !hidden {
             setCover(true)
+        }
+    }
+
+    // MARK: Lights: off when you leave, back on when you return (after dark only)
+
+    static let lat = 51.5074, lon = -0.1278   // London
+    private var leftSince: Date?
+    private var awayHandled = false
+    private var switchedOff: [String] = []
+    private var lightTicks = 0
+
+    var isDark: Bool {
+        let now = Date()
+        switch darkMode {
+        case 2:
+            return true
+        case 1:
+            let c = Calendar.current.dateComponents([.hour, .minute], from: now)
+            let h = Double(c.hour ?? 0) + Double(c.minute ?? 0) / 60
+            return startHour > endHour ? (h >= startHour || h < endHour) : (h >= startHour && h < endHour)
+        default:
+            guard let sun = Sun.today(lat: Self.lat, lon: Self.lon, now: now) else { return false }
+            let offset = sunOffset * 60
+            return now < sun.rise.addingTimeInterval(offset) || now > sun.set.addingTimeInterval(-offset)
+        }
+    }
+
+    /// e.g. "Dark from 17:35 to 07:55"
+    var darkSummary: String {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm"
+        switch darkMode {
+        case 2: return "Any time of day"
+        case 1: return String(format: "From %02d:00 to %02d:00", Int(startHour), Int(endHour))
+        default:
+            guard let sun = Sun.today(lat: Self.lat, lon: Self.lon) else { return "Sunset times unavailable" }
+            let offset = sunOffset * 60
+            return "Dark from \(f.string(from: sun.set.addingTimeInterval(-offset))) to \(f.string(from: sun.rise.addingTimeInterval(offset)))"
+        }
+    }
+
+    private func lightsTick() {
+        // Keep the list of lights fresh (every 20 seconds)
+        if lightTicks % 80 == 0 { refreshBridge() }
+        lightTicks += 1
+
+        let live = Date().timeIntervalSince(lastMotion) < 2
+        guard lightsEnabled, active, live, hasRecentred, !needsRecentre, !directions.isEmpty else {
+            leftSince = nil
+            return
+        }
+        if facing == nil {
+            if leftSince == nil { leftSince = Date() }
+            if !awayHandled, let since = leftSince, Date().timeIntervalSince(since) >= leaveMinutes * 60 {
+                awayHandled = true
+                if isDark {
+                    lightsOffForAway()
+                } else {
+                    lightNote = "You left your desk, but it's still light, so your lights weren't changed."
+                }
+            }
+        } else {
+            leftSince = nil
+            if awayHandled {
+                awayHandled = false
+                lightsOnForReturn()
+            }
+        }
+    }
+
+    private func targetNames() async -> [String] {
+        if lightTarget != "all" { return [lightTarget] }
+        return (await Bridge.devices())?.map(\.name) ?? []
+    }
+
+    private func lightsOffForAway() {
+        Task {
+            var turnedOff: [String] = []
+            var oldBridge = false
+            for name in await targetNames() {
+                guard let state = await Bridge.isOn(name) else { continue }
+                // Only switch off lights that are on, so we know which ones to switch back on
+                if state == nil { oldBridge = true }
+                if state ?? true, await Bridge.send(name, "off") { turnedOff.append(name) }
+            }
+            switchedOff = turnedOff
+            if turnedOff.isEmpty {
+                lightNote = bridgeOnline ? "You left your desk. Your lights were already off." : "You left your desk, but the bridge isn't running."
+            } else {
+                lightNote = "You left your desk, so Glance switched your lights off."
+                    + (oldBridge ? " (Update bulb_server.py so Glance can check which were on.)" : "")
+            }
+        }
+    }
+
+    private func lightsOnForReturn() {
+        let names = switchedOff
+        switchedOff = []
+        guard !names.isEmpty else { return }
+        guard lightsBackOn else { lightNote = "Welcome back. Lights left off (turn on \"back on\" in settings)."; return }
+        guard isDark else { lightNote = "Welcome back. It's light now, so your lights stayed off."; return }
+        Task {
+            for name in names { await Bridge.send(name, "on") }
+            lightNote = "Welcome back. Your lights are back on."
+            showBanner("Welcome back", "Your lights are back on")
+        }
+    }
+
+    func refreshBridge() {
+        Task {
+            if let list = await Bridge.devices() {
+                if list != bridgeLights { bridgeLights = list }
+                if !bridgeOnline { bridgeOnline = true }
+            } else if bridgeOnline {
+                bridgeOnline = false
+            }
+        }
+    }
+
+    /// Settings button: switches the chosen lights off, then back on 3 seconds later.
+    func testLights() {
+        Task {
+            let names = await targetNames()
+            guard !names.isEmpty else {
+                lightNote = "Can't reach the bridge. Start it with: cd ~/LookAndNod && python3 bulb_server.py"
+                return
+            }
+            lightNote = "Testing: lights off for 3 seconds..."
+            for n in names { await Bridge.send(n, "off") }
+            try? await Task.sleep(for: .seconds(3))
+            for n in names { await Bridge.send(n, "on") }
+            lightNote = "Test done. If your lights flicked off and on, it works."
         }
     }
 
@@ -874,6 +1074,9 @@ final class Glance: NSObject, ObservableObject, CMHeadphoneMotionManagerDelegate
         spotlightStrength = Setting.d("spotlightStrength"); privacy = Setting.b("privacy")
         awaySeconds = Setting.d("awaySeconds"); privacyStrength = Setting.d("privacyStrength")
         privacyWhenOut = Setting.b("privacyWhenOut"); sleepDisplay = Setting.b("sleepDisplay"); gammaDim = Setting.b("gammaDim")
+        lightsEnabled = Setting.b("lightsEnabled"); lightsBackOn = Setting.b("lightsBackOn")
+        leaveMinutes = Setting.d("leaveMinutes"); darkMode = Int(Setting.d("darkMode")); sunOffset = Setting.d("sunOffset")
+        startHour = Setting.d("startHour"); endHour = Setting.d("endHour")
     }
 
     private func screensChanged() {
