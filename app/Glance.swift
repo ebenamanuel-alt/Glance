@@ -42,7 +42,7 @@ enum Setting {
         "isOn": true, "followCursor": true, "autoSwitch": true, "rememberPosition": true,
         "focusOnSwitch": true, "nodEnabled": true, "throwEnabled": true, "spotlight": true,
         "privacy": true, "privacyWhenOut": false, "sleepDisplay": false, "gammaDim": true,
-        "lightsEnabled": true, "lightsBackOn": true,
+        "lightsEnabled": true, "lightsBackOn": true, "keepAirPodsAwake": true,
     ]
     static func d(_ key: String) -> Double { Pref.double(key, doubles[key] ?? 0) }
     static func b(_ key: String) -> Bool { Pref.bool(key, bools[key] ?? false) }
@@ -134,6 +134,17 @@ final class Glance: NSObject, ObservableObject, CMHeadphoneMotionManagerDelegate
     @Published var trusted = AXIsProcessTrusted()
     @Published var screens: [ScreenInfo] = []
     @Published var directions: [String: Direction] = [:] { didSet { saveDirections() } }
+    /// Plays an inaudible sound so your AirPods stay connected when nothing else is playing
+    @Published var keepAirPodsAwake = Setting.b("keepAirPodsAwake") { didSet { Pref.set(keepAirPodsAwake, "keepAirPodsAwake") } }
+    private let keepAlive = AudioKeepAlive()
+    private var lastMotionRestart = Date.distantPast
+    /// Each calibrated screen's real outline, from looking at its four corners
+    @Published var boxes: [String: ScreenBox] = [:] { didSet { saveBoxes() } }
+    /// Set while the corner calibration is running
+    @Published var calibration: Calibration?
+    private var calibrationWindow: NSWindow?
+    private var calibrationSamples: [(t: Double, y: Double, p: Double)] = []
+    private var calibrationNod = NodDetector()
     @Published var yaw = 0.0
     @Published var pitch = 0.0
     @Published var facing: String?          // the screen you're looking at
@@ -230,13 +241,11 @@ final class Glance: NSObject, ObservableObject, CMHeadphoneMotionManagerDelegate
         screens = ScreenInfo.all()
         nod.degrees = nodSize
         loadDirections()
+        loadBoxes()
         motion.delegate = self
         startShortcuts()
         if motion.isDeviceMotionAvailable {
-            motion.startDeviceMotionUpdates(to: .main) { [weak self] data, _ in
-                guard let self, let data else { return }
-                MainActor.assumeIsolated { self.handle(data) }
-            }
+            startMotion()
         } else {
             message = "This Mac can't read AirPods motion. It needs macOS 14 or later."
         }
@@ -300,6 +309,26 @@ final class Glance: NSObject, ObservableObject, CMHeadphoneMotionManagerDelegate
 
     // MARK: Head movement
 
+    private func startMotion() {
+        motion.startDeviceMotionUpdates(to: .main) { [weak self] data, _ in
+            guard let self, let data else { return }
+            MainActor.assumeIsolated { self.handle(data) }
+        }
+    }
+
+    /// Keeps the AirPods awake while Glance is on, and restarts head tracking if it stalls.
+    private func keepConnected() {
+        let want = isOn && keepAirPodsAwake
+        if want && !keepAlive.running { keepAlive.start() }
+        if !want && keepAlive.running { keepAlive.stop() }
+        let quiet = Date().timeIntervalSince(lastMotion)
+        if isOn, quiet > 4, Date().timeIntervalSince(lastMotionRestart) > 5, motion.isDeviceMotionAvailable {
+            lastMotionRestart = Date()
+            motion.stopDeviceMotionUpdates()
+            startMotion()
+        }
+    }
+
     private func handle(_ m: CMDeviceMotion) {
         lastMotion = Date()
         everHadMotion = true
@@ -311,6 +340,12 @@ final class Glance: NSObject, ObservableObject, CMHeadphoneMotionManagerDelegate
         let y = wrapAngle(rawYaw - centreYaw)
         let p = rawPitch - centrePitch
         if m.timestamp - lastDraw >= 1.0 / 30 { yaw = y; pitch = p; lastDraw = m.timestamp }
+
+        // While calibrating, head movement only feeds the calibration
+        if calibration != nil {
+            calibrationFeed(t: m.timestamp, y: wrapAngle(rawYaw - centreYaw), p: rawPitch - centrePitch)
+            return
+        }
 
         // Directions only mean something once you've recentred in this session
         guard active, hasRecentred, !needsRecentre else { return }
@@ -334,26 +369,42 @@ final class Glance: NSObject, ObservableObject, CMHeadphoneMotionManagerDelegate
         return (dy * dy + dp * dp).squareRoot()
     }
 
+    /// How far outside a calibrated screen's outline still counts as looking at it
+    static let boxMargin = 3.0
+
+    /// How far you are from a screen, and how far is still close enough.
+    /// Calibrated screens use their real outline; others use the saved direction and the Aim circle.
+    private func reach(_ key: String, _ y: Double, _ p: Double) -> (dist: Double, limit: Double, spot: Double)? {
+        if let b = boxes[key] {
+            let d = b.distance(y, p)
+            return (d, Self.boxMargin, Self.boxMargin + 10)
+        }
+        if let d = directions[key] {
+            return (distance(d, y, p), tolerance, tolerance * 1.8)
+        }
+        return nil
+    }
+
     private func updateFacing(_ y: Double, _ p: Double) {
-        let known = screens.compactMap { s in directions[s.key].map { (s.key, distance($0, y, p)) } }
-        // The spotlight follows whichever screen you're closest to, even slightly outside the aim circle,
+        let known = screens.compactMap { s in reach(s.key, y, p).map { (key: s.key, dist: $0.dist, limit: $0.limit, spot: $0.spot) } }
+        // The spotlight follows whichever screen you're closest to, even slightly outside it,
         // so looking down at a laptop still counts.
-        if let near = known.min(by: { $0.1 < $1.1 }), near.1 <= tolerance * 1.8 {
-            if near.0 != spotCandidate { spotCandidate = near.0; spotSince = Date() }
-            if activeScreen != near.0, Date().timeIntervalSince(spotSince) >= max(0.2, dwell) {
-                activeScreen = near.0
+        if let near = known.min(by: { $0.dist - $0.limit < $1.dist - $1.limit }), near.dist <= near.spot {
+            if near.key != spotCandidate { spotCandidate = near.key; spotSince = Date() }
+            if activeScreen != near.key, Date().timeIntervalSince(spotSince) >= max(0.2, dwell) {
+                activeScreen = near.key
                 updateDim()
             }
         }
-        guard let best = known.min(by: { $0.1 < $1.1 }), best.1 <= tolerance else {
+        let inReach = known.filter { $0.dist <= $0.limit }
+        guard let best = inReach.min(by: { $0.dist < $1.dist }) else {
             if facing != nil { facing = nil }
             return
         }
-        var pick = best.0
+        var pick = best.key
         // Near the edge between two screens, stay on the current one so it doesn't flicker
-        if let cur = facing, cur != best.0,
-           let curDist = known.first(where: { $0.0 == cur })?.1,
-           curDist <= tolerance, best.1 > curDist - 3 {
+        if let cur = facing, cur != best.key,
+           let c = inReach.first(where: { $0.key == cur }), best.dist > c.dist - 3 {
             pick = cur
         }
         if facing != pick { facing = pick }
@@ -605,7 +656,7 @@ final class Glance: NSObject, ObservableObject, CMHeadphoneMotionManagerDelegate
     private var spotSince = Date.distantPast
 
     private func spotTarget(_ key: String) -> CGFloat {
-        let on = active && !needsRecentre && spotlight && screens.count > 1 && activeScreen != nil && key != activeScreen && !hidden
+        let on = active && calibration == nil && !needsRecentre && spotlight && screens.count > 1 && activeScreen != nil && key != activeScreen && !hidden
         return on ? spotlightStrength : 0
     }
 
@@ -687,7 +738,7 @@ final class Glance: NSObject, ObservableObject, CMHeadphoneMotionManagerDelegate
             return
         }
         for (key, w) in dimWindows {
-            let on = active && !needsRecentre && spotlight && screens.count > 1 && activeScreen != nil && key != activeScreen && !hidden
+            let on = active && calibration == nil && !needsRecentre && spotlight && screens.count > 1 && activeScreen != nil && key != activeScreen && !hidden
             let target: CGFloat = on ? spotlightStrength : 0
             if target > 0 {
                 if let s = screens.first(where: { $0.key == key }), w.frame != s.frame { w.setFrame(s.frame, display: true) }
@@ -761,6 +812,7 @@ final class Glance: NSObject, ObservableObject, CMHeadphoneMotionManagerDelegate
     /// Runs four times a second: checks permissions and whether you've looked away.
     private func tick() {
         installTouchBar()
+        keepConnected()
         lightsTick()
         if testingDim, Date() >= testEndsAt.addingTimeInterval(0.5) { testingDim = false }
         enforceDim()
@@ -772,7 +824,7 @@ final class Glance: NSObject, ObservableObject, CMHeadphoneMotionManagerDelegate
         if worn, Date().timeIntervalSince(lastMotion) > 10 { setWorn(false) }
 
         // Never hide the screens while your AirPods are out or Glance is waiting for a recentre
-        guard active, privacy, live, !needsRecentre else {
+        guard active, privacy, live, !needsRecentre, calibration == nil else {
             awaySince = nil; slept = false
             if hidden { setCover(false) }
             return
@@ -853,7 +905,7 @@ final class Glance: NSObject, ObservableObject, CMHeadphoneMotionManagerDelegate
             return
         }
 
-        guard lightsEnabled, active, live, hasRecentred, !needsRecentre, !directions.isEmpty else {
+        guard lightsEnabled, active, live, hasRecentred, !needsRecentre, calibration == nil, !directions.isEmpty else {
             leftSince = nil
             return
         }
@@ -966,6 +1018,19 @@ final class Glance: NSObject, ObservableObject, CMHeadphoneMotionManagerDelegate
         }
     }
 
+    /// After the AirPods reconnect, assume you're facing the screen with the cursor (where you just
+    /// clicked pause or play) and line everything up from there, so no Recentre is needed.
+    private func autoAlign() -> Bool {
+        let cursor = toQuartz(NSEvent.mouseLocation)
+        guard let s = screens.first(where: { $0.quartzFrame.contains(cursor) }),
+              let d = boxes[s.key]?.centre ?? directions[s.key] else { return false }
+        centreYaw = wrapAngle(rawYaw - d.yaw)
+        centrePitch = rawPitch - d.pitch
+        needsRecentre = false
+        message = "AirPods back. Lined up with \(s.name), where your cursor is."
+        return true
+    }
+
     private func setWorn(_ on: Bool, disconnected: Bool = false) {
         guard on != worn else { return }
         worn = on
@@ -974,7 +1039,7 @@ final class Glance: NSObject, ObservableObject, CMHeadphoneMotionManagerDelegate
             // Only ask for a recentre if the AirPods really went back in the case, or were out for a while,
             // because that's when they can lose their sense of direction. Otherwise just carry on.
             let longOut = Date().timeIntervalSince(outAt ?? .distantPast) > 120
-            if hasRecentred && (outByDisconnect || longOut) {
+            if hasRecentred && (outByDisconnect || longOut) && !autoAlign() {
                 needsRecentre = true
                 message = "AirPods back. Face your main screen and press Recentre (or ⌃ ⌥ R)."
                 showBanner("AirPods back", "Face your main screen and press ⌃ ⌥ R")
@@ -1008,6 +1073,11 @@ final class Glance: NSObject, ObservableObject, CMHeadphoneMotionManagerDelegate
 
     private func startShortcuts() {
         let handler: (NSEvent) -> Bool = { [weak self] e in
+            // During calibration: Space saves the point you're looking at, Esc cancels
+            if MainActor.assumeIsolated({ self?.calibration != nil }) {
+                if e.keyCode == 49 { MainActor.assumeIsolated { self?.calibrationCapture(nil) }; return true }
+                if e.keyCode == 53 { MainActor.assumeIsolated { self?.cancelCalibration() }; return true }
+            }
             let f = e.modifierFlags.intersection(.deviceIndependentFlagsMask)
             guard f.contains(.control), f.contains(.option), !f.contains(.command) else { return false }
             switch e.charactersIgnoringModifiers?.lowercased() ?? "" {
@@ -1078,6 +1148,7 @@ final class Glance: NSObject, ObservableObject, CMHeadphoneMotionManagerDelegate
 
     func forget(_ s: ScreenInfo) {
         directions[s.key] = nil
+        boxes[s.key] = nil
     }
 
     /// Shows a big label on a screen, so you know which one is which.
@@ -1101,6 +1172,7 @@ final class Glance: NSObject, ObservableObject, CMHeadphoneMotionManagerDelegate
         spotlightStrength = Setting.d("spotlightStrength"); privacy = Setting.b("privacy")
         awaySeconds = Setting.d("awaySeconds"); privacyStrength = Setting.d("privacyStrength")
         privacyWhenOut = Setting.b("privacyWhenOut"); sleepDisplay = Setting.b("sleepDisplay"); gammaDim = Setting.b("gammaDim")
+        keepAirPodsAwake = Setting.b("keepAirPodsAwake")
         lightsEnabled = Setting.b("lightsEnabled"); lightsBackOn = Setting.b("lightsBackOn")
         leaveSeconds = Setting.d("leaveSeconds"); darkMode = Int(Setting.d("darkMode")); sunOffset = Setting.d("sunOffset")
         startHour = Setting.d("startHour"); endHour = Setting.d("endHour")
@@ -1120,5 +1192,201 @@ final class Glance: NSObject, ObservableObject, CMHeadphoneMotionManagerDelegate
     private func loadDirections() {
         if let data = UserDefaults.standard.data(forKey: "directions"),
            let saved = try? JSONDecoder().decode([String: Direction].self, from: data) { directions = saved }
+    }
+}
+
+
+// MARK: - Corner calibration
+// Look at the middle of your main screen, then at the four corners of each screen.
+// Glance learns each screen's real outline from where you sit.
+
+struct ScreenBox: Codable, Equatable {
+    var minYaw: Double, maxYaw: Double, minPitch: Double, maxPitch: Double
+
+    var centre: Direction { Direction(yaw: (minYaw + maxYaw) / 2, pitch: (minPitch + maxPitch) / 2) }
+
+    /// 0 when you're pointing inside the outline, otherwise how many degrees outside it
+    func distance(_ y: Double, _ p: Double) -> Double {
+        let c = centre
+        let yy = c.yaw + wrapAngle(y - c.yaw)
+        let dy = max(minYaw - yy, 0, yy - maxYaw)
+        let dp = max(minPitch - p, 0, p - maxPitch)
+        return (dy * dy + dp * dp).squareRoot()
+    }
+
+    /// Builds an outline from four corner directions. Too small (eyes moved, not head)? Widen it a little.
+    static func from(_ corners: [Direction]) -> ScreenBox {
+        let y0 = corners.first?.yaw ?? 0
+        let ys = corners.map { y0 + wrapAngle($0.yaw - y0) }
+        let ps = corners.map(\.pitch)
+        var b = ScreenBox(minYaw: ys.min() ?? 0, maxYaw: ys.max() ?? 0, minPitch: ps.min() ?? 0, maxPitch: ps.max() ?? 0)
+        let c = b.centre
+        if b.maxYaw - b.minYaw < 8 { b.minYaw = c.yaw - 4; b.maxYaw = c.yaw + 4 }
+        if b.maxPitch - b.minPitch < 5 { b.minPitch = c.pitch - 2.5; b.maxPitch = c.pitch + 2.5 }
+        return b
+    }
+
+    var width: Double { maxYaw - minYaw }
+    var height: Double { maxPitch - minPitch }
+}
+
+enum Corner: Int, CaseIterable {
+    case topLeft, topRight, bottomRight, bottomLeft
+    var name: String {
+        switch self {
+        case .topLeft: return "top-left"
+        case .topRight: return "top-right"
+        case .bottomRight: return "bottom-right"
+        case .bottomLeft: return "bottom-left"
+        }
+    }
+}
+
+struct Calibration: Equatable {
+    /// Screens to calibrate, in order
+    var keys: [String]
+    /// -1 = the starting point in the middle of the main screen; then 0, 1, 2... screens
+    var screenIndex = -1
+    var corner = Corner.topLeft
+    var corners: [Direction] = []
+    var done: [String: ScreenBox] = [:]
+    var tooSmall = false
+}
+
+extension Glance {
+    func startCalibration() {
+        guard !screens.isEmpty else { return }
+        guard airpods, worn else {
+            message = "Put your AirPods in first, then press Calibrate."
+            showBanner("AirPods needed", "Put your AirPods in, then press Calibrate")
+            return
+        }
+        // Main screen first, then the rest from left to right as macOS arranges them
+        let main = screens.first
+        let rest = screens.dropFirst().sorted { $0.frame.minX < $1.frame.minX }
+        calibration = Calibration(keys: ([main].compactMap { $0 } + rest).map(\.key))
+        calibrationSamples = []
+        calibrationNod.degrees = max(4, nodSize)
+        calibrationNod.reset()
+        setCover(false)
+        updateDim()
+        NSApp.activate(ignoringOtherApps: true)
+        showCalibrationStep()
+    }
+
+    func cancelCalibration() {
+        calibration = nil
+        calibrationWindow?.orderOut(nil)
+        calibrationWindow = nil
+        message = "Calibration cancelled. Your screens are as they were."
+        updateDim()
+    }
+
+    fileprivate func calibrationFeed(t: Double, y: Double, p: Double) {
+        calibrationSamples.append((t, y, p))
+        calibrationSamples.removeAll { t - $0.t > 1.6 }
+        if calibrationNod.feed(t: t, pitch: p, yaw: y) {
+            // Use where you were pointing just before the nod started
+            let before = calibrationSamples.filter { t - $0.t >= 0.9 && t - $0.t <= 1.3 }
+            calibrationCapture(average(before.isEmpty ? Array(calibrationSamples.prefix(5)) : before))
+        }
+    }
+
+    private func average(_ v: [(t: Double, y: Double, p: Double)]) -> Direction? {
+        guard let first = v.first else { return nil }
+        let ys = v.map { first.y + wrapAngle($0.y - first.y) }
+        return Direction(yaw: wrapAngle(ys.reduce(0, +) / Double(ys.count)), pitch: v.map(\.p).reduce(0, +) / Double(v.count))
+    }
+
+    /// Saves where you're pointing for the current step (now, or the given direction) and moves on.
+    func calibrationCapture(_ given: Direction?) {
+        guard var c = calibration else { return }
+        NSHapticFeedbackManager.defaultPerformer.perform(.levelChange, performanceTime: .now)
+        if c.screenIndex == -1 {
+            // Starting point: the middle of the main screen becomes straight ahead
+            recentre()
+            calibrationSamples = []
+            calibrationNod.reset()
+            c.screenIndex = 0
+            c.corner = .topLeft
+            calibration = c
+            showCalibrationStep()
+            return
+        }
+        let recent = calibrationSamples.filter { (calibrationSamples.last?.t ?? 0) - $0.t <= 0.3 }
+        guard let d = given ?? average(recent) else { return }
+        c.corners.append(d)
+        if let next = Corner(rawValue: c.corner.rawValue + 1) {
+            c.corner = next
+        } else {
+            let box = ScreenBox.from(c.corners)
+            // If your head barely turned, you probably moved only your eyes
+            let y0 = c.corners[0].yaw
+            let turns = c.corners.map { wrapAngle($0.yaw - y0) }
+            if (turns.max() ?? 0) - (turns.min() ?? 0) < 8 { c.tooSmall = true }
+            c.done[c.keys[c.screenIndex]] = box
+            c.corners = []
+            c.corner = .topLeft
+            c.screenIndex += 1
+            if c.screenIndex >= c.keys.count {
+                finishCalibration(c)
+                return
+            }
+        }
+        calibration = c
+        showCalibrationStep()
+    }
+
+    private func finishCalibration(_ c: Calibration) {
+        for (key, box) in c.done {
+            boxes[key] = box
+            directions[key] = box.centre
+        }
+        calibration = nil
+        calibrationWindow?.orderOut(nil)
+        calibrationWindow = nil
+        hasRecentred = true
+        facing = nil
+        activeScreen = nil
+        updateDim()
+        if c.tooSmall {
+            message = "Calibrated. Tip: turn your head a little towards each dot, not just your eyes, for the best accuracy."
+            showBanner("Calibrated", "Next time, turn your head a little towards each dot")
+        } else {
+            message = "Calibrated. Glance now knows the real outline of each screen."
+            showBanner("Calibrated", "Glance knows where each screen is")
+        }
+    }
+
+    private func showCalibrationStep() {
+        guard let c = calibration else { return }
+        let key = c.screenIndex < 0 ? c.keys.first : c.keys[c.screenIndex]
+        guard let k = key, let s = screens.first(where: { $0.key == k }) else { cancelCalibration(); return }
+        calibrationWindow?.orderOut(nil)
+        let w = makeOverlay(for: s, level: NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 1))
+        let host = NSHostingView(rootView: CalibrationOverlay(
+            screenName: s.name,
+            screenNumber: max(0, c.screenIndex) + 1,
+            screenCount: c.keys.count,
+            corner: c.screenIndex < 0 ? nil : c.corner,
+            stepsDone: c.screenIndex < 0 ? 0 : c.screenIndex * 4 + c.corner.rawValue + 1,
+            stepsTotal: c.keys.count * 4 + 1))
+        host.frame = NSRect(origin: .zero, size: s.frame.size)
+        w.contentView = host
+        w.alphaValue = 1
+        w.orderFrontRegardless()
+        calibrationWindow = w
+        message = c.screenIndex < 0
+            ? "Calibrating: face the middle of \(s.name), then press Space or nod."
+            : "Calibrating \(s.name): turn your head to the \(c.corner.name) dot, then press Space or nod."
+    }
+
+    private func saveBoxes() {
+        if let data = try? JSONEncoder().encode(boxes) { UserDefaults.standard.set(data, forKey: "boxes") }
+    }
+
+    private func loadBoxes() {
+        if let data = UserDefaults.standard.data(forKey: "boxes"),
+           let saved = try? JSONDecoder().decode([String: ScreenBox].self, from: data) { boxes = saved }
     }
 }

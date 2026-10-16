@@ -117,11 +117,12 @@ struct StatusCard: View {
 
     private var state: (mood: Mood, symbol: String, title: String, detail: String) {
         let facingName = g.screens.first { $0.key == g.facing }?.name
+        if g.calibration != nil { return (.waiting, "viewfinder", "Calibrating", "Turn your head to each dot, then press Space or nod. Esc cancels.") }
         if !g.isOn { return (.off, "eye.slash", "Glance is off", "Your screens work as normal. Switch it on at the top, or press ⌃ ⌥ G.") }
         if !g.airpods { return (.waiting, "airpodspro", "Waiting for your AirPods", "Put your AirPods Pro in and Glance starts by itself.") }
         if !g.worn { return (.waiting, "airpodspro", "Paused: AirPods out", "Your screens work as normal until you put them back in.") }
         if g.needsRecentre { return (.waiting, "scope", "Face your main screen and recentre", "Your AirPods were away for a while, so Glance needs a fresh starting point.") }
-        if g.directions.isEmpty { return (.waiting, "display.2", "Save your screens to begin", "Look at each screen and press Save in the list on the right.") }
+        if g.directions.isEmpty { return (.waiting, "display.2", "Save your screens to begin", "Press Calibrate and look at the corners of each screen. It takes about 30 seconds.") }
         if g.hidden { return (.good, "lock.fill", "Screens hidden while you're away", "Look back at a screen, or hold ⌃ ⌥, to show them.") }
         let dimmed = g.screens.filter { $0.key != g.activeScreen && g.directions[$0.key] != nil }.map(\.name)
         var parts: [String] = []
@@ -166,8 +167,11 @@ struct ScreensCard: View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
                 Text("Screens").font(.headline)
-                Spacer()
                 Text("\(g.directions.count) of \(g.screens.count) saved").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button { g.startCalibration() } label: { Label("Calibrate", systemImage: "viewfinder") }
+                    .controlSize(.small)
+                    .help("Look at the corners of each screen so Glance learns exactly where they are")
             }
             .padding(.horizontal, 14).padding(.top, 12).padding(.bottom, 6)
             ForEach(Array(g.screens.enumerated()), id: \.element.id) { i, s in
@@ -184,7 +188,8 @@ struct ScreensCard: View {
         let saved = g.directions[s.key] != nil
         let looking = g.facing == s.key
         let dimmed = g.spotlight && saved && g.activeScreen != nil && g.activeScreen != s.key
-        let detail = !saved ? "Not saved yet" : (looking ? "You're looking at it" : (dimmed ? "Saved · dimmed" : "Saved"))
+        let kind = g.boxes[s.key] != nil ? "Calibrated" : "Saved"
+        let detail = !saved ? "Not saved yet" : (looking ? "You're looking at it" : (dimmed ? "\(kind) · dimmed" : kind))
         return HStack(spacing: 10) {
             Image(systemName: looking ? "eye" : (s.isBuiltIn ? "laptopcomputer" : "display"))
                 .frame(width: 20)
@@ -650,6 +655,13 @@ struct SettingsView: View {
 
     @ViewBuilder private var cursor: some View {
         Section {
+            LabeledContent {
+                Button("Calibrate") { g.startCalibration() }
+            } label: {
+                row("Calibrate your screens", "Look at the corners of each screen so Glance knows exactly where they are")
+            }
+        }
+        Section {
             Toggle(isOn: $g.followCursor) { row("Move the cursor to the screen you look at", "The cursor jumps to the screen you're facing") }
             Picker("Switch screens", selection: $g.autoSwitch) {
                 Text("Automatically").tag(true)
@@ -663,7 +675,7 @@ struct SettingsView: View {
                 slider("Look time", $g.dwell, 0...1.5, step: 0.05, String(format: "%.2f s", g.dwell),
                        "How long you look at a screen before switching. Longer ignores quick glances.")
                 slider("Aim", $g.tolerance, 10...45, step: 1, "\(Int(g.tolerance))°",
-                       "How close to a screen you must look. Smaller is more precise.")
+                       "How close to a screen you must look. Only for screens you haven't calibrated.")
                 slider("Nod size", $g.nodSize, 3...15, step: 1, "\(Int(g.nodSize))°",
                        "How far your head must dip for a nod.")
                 Toggle("Return to where the cursor was on that screen", isOn: $g.rememberPosition)
@@ -765,6 +777,12 @@ struct SettingsView: View {
 
     @ViewBuilder private var airpods: some View {
         Section {
+            Toggle(isOn: $g.keepAirPodsAwake) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Keep AirPods connected")
+                    Text("Plays a sound too quiet to hear, so pausing a video doesn't disconnect them").font(.caption).foregroundStyle(.secondary)
+                }
+            }
             LabeledContent("AirPods") {
                 Text(!g.airpods ? "Not connected" : (g.worn ? "In your ears" : "Out"))
                     .foregroundStyle(g.airpods && g.worn ? Color.green : Color.secondary)
@@ -837,6 +855,70 @@ struct MenuContent: View {
         }
         Divider()
         Button("Quit Glance") { NSApp.terminate(nil) }
+    }
+}
+
+// MARK: - Calibration overlay: a dot in each corner to look at
+
+struct CalibrationOverlay: View {
+    let screenName: String
+    let screenNumber: Int
+    let screenCount: Int
+    /// nil = the starting point in the middle of the screen
+    let corner: Corner?
+    let stepsDone: Int
+    let stepsTotal: Int
+
+    @State private var pulse = false
+
+    var body: some View {
+        GeometryReader { geo in
+            let size = geo.size
+            let inset: CGFloat = 70
+            let dot: CGPoint = {
+                switch corner {
+                case .none: return CGPoint(x: size.width / 2, y: size.height / 2)
+                case .topLeft: return CGPoint(x: inset, y: inset + 30)
+                case .topRight: return CGPoint(x: size.width - inset, y: inset + 30)
+                case .bottomRight: return CGPoint(x: size.width - inset, y: size.height - inset)
+                case .bottomLeft: return CGPoint(x: inset, y: size.height - inset)
+                }
+            }()
+            ZStack {
+                Color.black.opacity(0.62)
+
+                VStack(spacing: 10) {
+                    Text(corner == nil ? "Calibrate Glance" : "Screen \(screenNumber) of \(screenCount) · \(screenName)")
+                        .font(.system(size: 15, weight: .medium)).foregroundStyle(.white.opacity(0.75))
+                    Text(corner == nil ? "Face the middle of this screen" : "Turn your head to the \(corner!.name) dot")
+                        .font(.system(size: 30, weight: .semibold)).foregroundStyle(.white)
+                    Text("Then press Space or nod. Turn your head, not just your eyes.")
+                        .font(.system(size: 15)).foregroundStyle(.white.opacity(0.75))
+                    HStack(spacing: 6) {
+                        ForEach(0..<stepsTotal, id: \.self) { i in
+                            Circle().fill(i < stepsDone ? Color.accentColor : Color.white.opacity(0.3)).frame(width: 7, height: 7)
+                        }
+                    }
+                    .padding(.top, 8)
+                    Text("Esc to cancel").font(.caption).foregroundStyle(.white.opacity(0.5)).padding(.top, 4)
+                }
+                .padding(.horizontal, 36).padding(.vertical, 26)
+                .background(Color.black.opacity(0.35), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+
+                ZStack {
+                    Circle().stroke(Color.accentColor.opacity(0.5), lineWidth: 2)
+                        .frame(width: 70, height: 70)
+                        .scaleEffect(pulse ? 1.25 : 0.8)
+                        .opacity(pulse ? 0 : 1)
+                    Circle().fill(Color.white).frame(width: 30, height: 30)
+                    Circle().fill(Color.accentColor).frame(width: 14, height: 14)
+                }
+                .position(dot)
+            }
+            .onAppear {
+                withAnimation(.easeOut(duration: 1.2).repeatForever(autoreverses: false)) { pulse = true }
+            }
+        }
     }
 }
 
