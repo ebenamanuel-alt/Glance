@@ -25,6 +25,11 @@ struct ContentView: View {
         .padding(20)
         .frame(minWidth: 920, minHeight: 580)
         .onAppear { g.start() }
+        // Touch Bar buttons, shown while the Glance window is in front
+        .touchBar {
+            Button(g.isOn ? "Glance: On" : "Glance: Off") { g.isOn.toggle() }
+            Button("Recentre") { g.recentre() }
+        }
     }
 
     // MARK: Header
@@ -43,7 +48,7 @@ struct ContentView: View {
             }
             Spacer(minLength: 12)
             HStack(spacing: 14) {
-                pill("airpodspro", "AirPods", g.airpods)
+                pill("airpodspro", !g.airpods ? "AirPods" : (g.worn ? "AirPods in" : "AirPods out"), g.airpods && g.worn)
                 pill("hand.raised", g.trusted ? "Allowed" : "Allow Accessibility", g.trusted)
                 pill("keyboard", g.listening ? "Listening" : "⌃ ⌥", g.listening, neutral: true)
             }
@@ -134,6 +139,7 @@ struct ContentView: View {
             hint("arrow.down.circle", "Hold ⌃ ⌥ and nod: focus that window")
             hint("macwindow.on.rectangle", "Hold ⌃ ⌥ ⌘ and look: move the window")
             hint("lock.shield", "Look away: screens hide")
+            hint("command", "⌃ ⌥ G on/off · ⌃ ⌥ R recentre")
             Spacer()
         }
         .font(.caption)
@@ -288,7 +294,8 @@ struct SettingsPanel: View {
                 .pickerStyle(.segmented)
                 slider("Cover strength", $g.privacyStrength, 0.3...1, step: 0.05, format: { "\(Int($0 * 100))%" },
                        hint: "100% hides everything completely.")
-                Toggle("Also hide when I take my AirPods out", isOn: $g.privacyWhenOut)
+                Text("Taking your AirPods out pauses Glance, so your screens always work while they're charging.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 Text("Holding ⌃ ⌥ always shows your screens again.").font(.caption).foregroundStyle(.secondary)
 
                 Divider()
@@ -335,14 +342,31 @@ struct MenuContent: View {
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        Toggle("Glance on", isOn: $g.isOn)
-        Button("Recentre") { g.recentre() }
+        Toggle("Glance on   ⌃⌥G", isOn: $g.isOn)
+        Button("Recentre   ⌃⌥R") { g.recentre() }
+        if g.airpods && !g.worn { Text("Paused: AirPods out") }
+        if g.needsRecentre { Text("Press Recentre to resume") }
         Divider()
         Button("Open Glance") {
             openWindow(id: "main")
             NSApp.activate(ignoringOtherApps: true)
         }
         Button("Quit Glance") { NSApp.terminate(nil) }
+    }
+}
+
+// MARK: - Short message shown in the middle of the screen
+
+struct BannerView: View {
+    let title: String
+    let detail: String
+    var body: some View {
+        VStack(spacing: 6) {
+            Text(title).font(.system(size: 26, weight: .bold))
+            Text(detail).font(.callout).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 22))
     }
 }
 
