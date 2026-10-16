@@ -34,7 +34,7 @@ enum Pref {
 /// Default settings, and "Reset to defaults" puts these back.
 enum Setting {
     static let doubles: [String: Double] = [
-        "dwell": 0.35, "tolerance": 25, "nodSize": 5, "spotlightStrength": 0.35,
+        "dwell": 0.35, "tolerance": 25, "nodSize": 5, "spotlightStrength": 0.45,
         "awaySeconds": 10, "privacyStrength": 0.85,
     ]
     static let bools: [String: Bool] = [
@@ -427,8 +427,14 @@ final class Glance: ObservableObject {
     // MARK: 5. Spotlight and 7. Privacy cover
 
     private func makeOverlay(for s: ScreenInfo, level: NSWindow.Level) -> NSWindow {
-        let w = NSWindow(contentRect: s.frame, styleMask: .borderless, backing: .buffered, defer: false)
-        w.setFrame(s.frame, display: false)
+        // Create the window on that exact display, so macOS doesn't move it to the main screen
+        let screen = NSScreen.screens.first { $0.frame == s.frame }
+        let w = NSWindow(contentRect: NSRect(origin: .zero, size: s.frame.size), styleMask: .borderless,
+                         backing: .buffered, defer: false, screen: screen)
+        w.setFrame(s.frame, display: true)
+        w.isMovable = false
+        w.canHide = false
+        w.hidesOnDeactivate = false
         w.isOpaque = false
         w.backgroundColor = .clear
         w.hasShadow = false
@@ -484,15 +490,51 @@ final class Glance: ObservableObject {
         updateDim()
     }
 
+    private var testingDim = false
+
     private func updateDim() {
+        guard !testingDim else { return }
         for (key, w) in dimWindows {
             let on = isOn && spotlight && screens.count > 1 && activeScreen != nil && key != activeScreen && !hidden
-            let target: CGFloat = on ? spotlightStrength : 0
-            if abs(w.alphaValue - target) > 0.01 {
-                NSAnimationContext.runAnimationGroup { ctx in
-                    ctx.duration = 0.35
-                    w.animator().alphaValue = target
-                }
+            setDim(w, on ? spotlightStrength : 0)
+        }
+    }
+
+    private func setDim(_ w: NSWindow, _ target: CGFloat) {
+        if target > 0 {
+            // Make sure it's really on that screen and on top, even after display or Space changes
+            if let key = dimWindows.first(where: { $0.value === w })?.key,
+               let s = screens.first(where: { $0.key == key }), w.frame != s.frame {
+                w.setFrame(s.frame, display: true)
+            }
+            w.orderFrontRegardless()
+        }
+        guard abs(w.alphaValue - target) > 0.01 else { return }
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.3
+            ctx.allowsImplicitAnimation = true
+            w.animator().alphaValue = target
+        } completionHandler: {
+            // If the animation didn't apply, set it directly
+            MainActor.assumeIsolated { if abs(w.alphaValue - target) > 0.01 { w.alphaValue = target } }
+        }
+    }
+
+    /// Dims every screen except the one with the cursor for two seconds, to check spotlight works.
+    func testDim() {
+        if dimWindows.isEmpty { buildOverlays() }
+        let cursor = toQuartz(NSEvent.mouseLocation)
+        let keep = screens.first { $0.quartzFrame.contains(cursor) }?.key
+        testingDim = true
+        for (key, w) in dimWindows { setDim(w, key == keep ? 0 : max(0.4, spotlightStrength)) }
+        message = screens.count > 1
+            ? "Testing: every screen except this one should go darker for 2 seconds."
+            : "Only one screen found. Spotlight needs two or more."
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.testingDim = false
+                self.updateDim()
             }
         }
     }
