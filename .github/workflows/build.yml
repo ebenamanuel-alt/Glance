@@ -1,0 +1,28 @@
+name: Build Glance
+
+# Builds the Mac app on GitHub's Mac and gives you a zip to download.
+on:
+  push:
+    paths:
+      - "app/**"
+      - ".github/workflows/build.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the app
+        working-directory: app
+        run: bash build.sh
+
+      - name: Zip the app
+        working-directory: app
+        run: ditto -c -k --keepParent Glance.app Glance-app.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Glance
+          path: app/Glance-app.zip
