@@ -40,7 +40,7 @@ enum Setting {
     static let bools: [String: Bool] = [
         "isOn": true, "followCursor": true, "autoSwitch": true, "rememberPosition": true,
         "focusOnSwitch": true, "nodEnabled": true, "throwEnabled": true, "spotlight": true,
-        "privacy": true, "privacyWhenOut": false, "sleepDisplay": false,
+        "privacy": true, "privacyWhenOut": false, "sleepDisplay": false, "gammaDim": true,
     ]
     static func d(_ key: String) -> Double { Pref.double(key, doubles[key] ?? 0) }
     static func b(_ key: String) -> Bool { Pref.bool(key, bools[key] ?? false) }
@@ -52,6 +52,7 @@ struct ScreenInfo: Identifiable, Equatable {
     let frame: CGRect          // AppKit coordinates
     let quartzFrame: CGRect    // window-system coordinates (top left origin)
     let quartzVisible: CGRect  // the same, without the menu bar and Dock
+    let displayID: CGDirectDisplayID
     var id: String { key }
 
     @MainActor static func all() -> [ScreenInfo] {
@@ -61,7 +62,8 @@ struct ScreenInfo: Identifiable, Equatable {
             let n = (seen[base] ?? 0) + 1
             seen[base] = n
             return ScreenInfo(key: n > 1 ? "\(base) #\(n)" : base, name: s.localizedName,
-                              frame: s.frame, quartzFrame: toQuartz(s.frame), quartzVisible: toQuartz(s.visibleFrame))
+                              frame: s.frame, quartzFrame: toQuartz(s.frame), quartzVisible: toQuartz(s.visibleFrame),
+                              displayID: (s.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0)
         }
     }
 }
@@ -153,6 +155,15 @@ final class Glance: ObservableObject {
     @Published var privacyStrength = Setting.d("privacyStrength") { didSet { Pref.set(privacyStrength, "privacyStrength"); buildOverlays() } }
     @Published var privacyWhenOut = Setting.b("privacyWhenOut") { didSet { Pref.set(privacyWhenOut, "privacyWhenOut") } }
     @Published var sleepDisplay = Setting.b("sleepDisplay") { didSet { Pref.set(sleepDisplay, "sleepDisplay") } }
+    /// true: dim by darkening the screen's colours (works on external monitors). false: a dark see-through layer.
+    @Published var gammaDim = Setting.b("gammaDim") {
+        didSet {
+            Pref.set(gammaDim, "gammaDim")
+            for s in screens { setGamma(s.key, 0) }
+            for w in dimWindows.values { setDim(w, 0) }
+            updateDim()
+        }
+    }
 
     // Internal state
     private let motion = CMHeadphoneMotionManager()
@@ -177,6 +188,11 @@ final class Glance: ObservableObject {
     func start() {
         guard !started else { return }
         started = true
+        CGDisplayRestoreColorSyncSettings()
+        NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification,
+                                               object: nil, queue: .main) { _ in
+            CGDisplayRestoreColorSyncSettings()   // always put normal colours back when Glance quits
+        }
         screens = ScreenInfo.all()
         nod.degrees = nodSize
         loadDirections()
@@ -236,6 +252,15 @@ final class Glance: ObservableObject {
 
     private func updateFacing(_ y: Double, _ p: Double) {
         let known = screens.compactMap { s in directions[s.key].map { (s.key, distance($0, y, p)) } }
+        // The spotlight follows whichever screen you're closest to, even slightly outside the aim circle,
+        // so looking down at a laptop still counts.
+        if let near = known.min(by: { $0.1 < $1.1 }), near.1 <= tolerance * 1.8 {
+            if near.0 != spotCandidate { spotCandidate = near.0; spotSince = Date() }
+            if activeScreen != near.0, Date().timeIntervalSince(spotSince) >= max(0.2, dwell) {
+                activeScreen = near.0
+                updateDim()
+            }
+        }
         guard let best = known.min(by: { $0.1 < $1.1 }), best.1 <= tolerance else {
             if facing != nil { facing = nil }
             return
@@ -491,12 +516,94 @@ final class Glance: ObservableObject {
     }
 
     private var testingDim = false
+    private var testEndsAt = Date.distantPast
+    private var spotCandidate: String?
+    private var spotSince = Date.distantPast
+
+    private func spotTarget(_ key: String) -> CGFloat {
+        let on = isOn && spotlight && screens.count > 1 && activeScreen != nil && key != activeScreen && !hidden
+        return on ? spotlightStrength : 0
+    }
 
     private func updateDim() {
         guard !testingDim else { return }
+        for s in screens { dimScreen(s.key, spotTarget(s.key)) }
+    }
+
+    /// Dims one screen using whichever method is chosen in settings.
+    private func dimScreen(_ key: String, _ target: CGFloat) {
+        if gammaDim {
+            setGamma(key, Double(target))
+            if let w = dimWindows[key], w.alphaValue > 0 { setDim(w, 0) }
+        } else {
+            setGamma(key, 0)
+            if let w = dimWindows[key] { setDim(w, target) }
+        }
+    }
+
+    // MARK: Colour dimming
+    // Turns down the colours the Mac sends to a display. Works on external monitors too,
+    // because it changes the picture itself rather than drawing a window on top.
+
+    private var gammaNow: [String: Double] = [:]
+    private var gammaGoal: [String: Double] = [:]
+    private var fadeTimer: Timer?
+
+    private func setGamma(_ key: String, _ target: Double) {
+        gammaGoal[key] = target
+        if (gammaNow[key] ?? 0) == target { return }
+        guard fadeTimer == nil else { return }
+        fadeTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.fadeStep() }
+        }
+    }
+
+    private func fadeStep() {
+        var moving = false
+        for (key, goal) in gammaGoal {
+            let now = gammaNow[key] ?? 0
+            guard now != goal else { continue }
+            let next = abs(goal - now) <= 0.04 ? goal : now + (goal > now ? 0.04 : -0.04)
+            gammaNow[key] = next
+            applyGamma(key, next)
+            if next != goal { moving = true }
+        }
+        if !moving {
+            fadeTimer?.invalidate()
+            fadeTimer = nil
+            if gammaNow.values.allSatisfy({ $0 == 0 }) { CGDisplayRestoreColorSyncSettings() }
+        }
+    }
+
+    private func applyGamma(_ key: String, _ amount: Double) {
+        guard let s = screens.first(where: { $0.key == key }), s.displayID != 0 else { return }
+        let top = CGGammaValue(max(0.15, 1 - amount))
+        CGSetDisplayTransferByFormula(s.displayID, 0, top, 1, 0, top, 1, 0, top, 1)
+    }
+
+    /// Four times a second, makes sure each screen's dim layer is really showing as it should.
+    /// macOS sometimes hides or moves these layers when apps switch or Spaces change.
+    private func enforceDim() {
+        guard !testingDim else { return }
+        if gammaDim {
+            // Night Shift or True Tone can reset the colours, so put the dimming back
+            for s in screens {
+                let target = Double(spotTarget(s.key))
+                if gammaGoal[s.key] != target { setGamma(s.key, target) }
+                else if fadeTimer == nil, let now = gammaNow[s.key], now > 0 { applyGamma(s.key, now) }
+            }
+            return
+        }
         for (key, w) in dimWindows {
             let on = isOn && spotlight && screens.count > 1 && activeScreen != nil && key != activeScreen && !hidden
-            setDim(w, on ? spotlightStrength : 0)
+            let target: CGFloat = on ? spotlightStrength : 0
+            if target > 0 {
+                if let s = screens.first(where: { $0.key == key }), w.frame != s.frame { w.setFrame(s.frame, display: true) }
+                if !w.isVisible || !w.isOnActiveSpace { w.orderFrontRegardless() }
+                if abs(w.alphaValue - target) > 0.05 { setDim(w, target) }
+            } else if w.alphaValue > 0.05 {
+                setDim(w, 0)
+            }
         }
     }
 
@@ -526,7 +633,8 @@ final class Glance: ObservableObject {
         let cursor = toQuartz(NSEvent.mouseLocation)
         let keep = screens.first { $0.quartzFrame.contains(cursor) }?.key
         testingDim = true
-        for (key, w) in dimWindows { setDim(w, key == keep ? 0 : max(0.4, spotlightStrength)) }
+        testEndsAt = Date().addingTimeInterval(2)
+        for s in screens { dimScreen(s.key, s.key == keep ? 0 : max(0.4, spotlightStrength)) }
         message = screens.count > 1
             ? "Testing: every screen except this one should go darker for 2 seconds."
             : "Only one screen found. Spotlight needs two or more."
@@ -560,6 +668,8 @@ final class Glance: ObservableObject {
 
     /// Runs four times a second: checks permissions and whether you've looked away.
     private func tick() {
+        if testingDim, Date() >= testEndsAt.addingTimeInterval(0.5) { testingDim = false }
+        enforceDim()
         let t = AXIsProcessTrusted()
         if t != trusted { trusted = t }
         let live = Date().timeIntervalSince(lastMotion) < 2
@@ -640,10 +750,12 @@ final class Glance: ObservableObject {
         throwEnabled = Setting.b("throwEnabled"); spotlight = Setting.b("spotlight")
         spotlightStrength = Setting.d("spotlightStrength"); privacy = Setting.b("privacy")
         awaySeconds = Setting.d("awaySeconds"); privacyStrength = Setting.d("privacyStrength")
-        privacyWhenOut = Setting.b("privacyWhenOut"); sleepDisplay = Setting.b("sleepDisplay")
+        privacyWhenOut = Setting.b("privacyWhenOut"); sleepDisplay = Setting.b("sleepDisplay"); gammaDim = Setting.b("gammaDim")
     }
 
     private func screensChanged() {
+        CGDisplayRestoreColorSyncSettings()
+        gammaNow = [:]; gammaGoal = [:]
         screens = ScreenInfo.all()
         buildOverlays()
     }
